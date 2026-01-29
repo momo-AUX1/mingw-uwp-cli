@@ -19,6 +19,12 @@ except Exception:
 TEXT_EXTENSIONS = {'.txt', '.in', '.xml', '.xaml', '.cpp', '.h', '.hpp', '.c', '.cmake', 'CMakeLists.txt', '.md'}
 DEFAULT_CONFIG_NAME = 'mingw_winrt.json'
 ARCH_CHOICES = ('x64', 'x86', 'arm64', 'arm')
+MSVC_DLLS = (
+    'msvcp140_app.dll',
+    'vcruntime140_app.dll',
+    'vcruntime140_1_app.dll',
+)
+REPO_ROOT = Path(__file__).parent.parent
 NAMESPACE_URIS = {
     'foundation': 'http://schemas.microsoft.com/appx/manifest/foundation/windows10',
     'uap': 'http://schemas.microsoft.com/appx/manifest/uap/windows10',
@@ -184,6 +190,42 @@ Add-AppxPackage -Path $Package
 """
     (out_dir / 'install.ps1').write_text(script, encoding='utf-8')
 
+def _ensure_deps_layout(out_dir: Path) -> None:
+    for sub in ('bin', 'include', 'lib'):
+        (out_dir / 'deps' / sub).mkdir(parents=True, exist_ok=True)
+
+def _arch_folder(arch: str) -> str:
+    return {
+        'x64': 'x64',
+        'x86': 'x86',
+        'arm64': 'arm64',
+        'arm': 'arm',
+    }.get(arch, arch)
+
+def _find_msvc_redist_dir(arch: str) -> Optional[Path]:
+    repo_msvc = REPO_ROOT / 'MSVC'
+    if repo_msvc.exists():
+        return repo_msvc
+    return None
+
+def _copy_msvc_dlls(out_dir: Path, arch: str) -> None:
+    redist_dir = _find_msvc_redist_dir(arch)
+    if not redist_dir:
+        _warn("⚠️  MSVC redist not found; skipping MSVC DLL copy.")
+        return
+    dest = out_dir / 'deps' / 'bin'
+    dest.mkdir(parents=True, exist_ok=True)
+    any_copied = False
+    for dll in MSVC_DLLS:
+        src = redist_dir / dll
+        if src.exists():
+            shutil.copy2(src, dest / dll)
+            any_copied = True
+        else:
+            _warn(f"⚠️  Missing MSVC DLL: {src}")
+    if not any_copied:
+        _warn(f"⚠️  No specified MSVC DLLs were found in {redist_dir}; nothing was copied.")
+
 def _get_manifest_paths(project_dir: Path) -> list:
     paths = []
     for name in ('AppxManifest.in', 'AppxManifest.xml'):
@@ -283,7 +325,7 @@ def _update_manifest_capabilities(project_dir: Path, selected_caps: set) -> None
     for path in _get_manifest_paths(project_dir):
         _update_manifest_capabilities_file(path, selected_caps)
 
-def _write_project_config(out_dir: Path, project_type: str, project_name: str, arch: str, publisher: str) -> Path:
+def _write_project_config(out_dir: Path, project_type: str, project_name: str, arch: str, publisher: str, include_msvc_dlls: bool) -> Path:
     config = {
         'name': project_name,
         'type': project_type,
@@ -296,6 +338,7 @@ def _write_project_config(out_dir: Path, project_type: str, project_name: str, a
             'banner': ''
         },
         'capabilities': [],
+        'includeMsvcDlls': include_msvc_dlls,
         'version': 1
     }
     config_path = out_dir / DEFAULT_CONFIG_NAME
@@ -314,7 +357,7 @@ def copy_tree(src: Path, dst: Path, replacements, skip_binary_replace=True):
             if is_text_file(s):
                 replace_in_file(d, replacements)
 
-def generate_project(template_dir: Path, project_type: str, project_name: str, out_dir: Path, arch: str, publisher: str, reuse_images: Optional[Path], overwrite: bool):
+def generate_project(template_dir: Path, project_type: str, project_name: str, out_dir: Path, arch: str, publisher: str, reuse_images: Optional[Path], overwrite: bool, include_msvc_dlls: bool):
     if out_dir.exists() and any(out_dir.iterdir()) and not overwrite:
         raise FileExistsError(f"Output directory {out_dir} exists and is not empty (use --overwrite).")
 
@@ -356,7 +399,10 @@ def generate_project(template_dir: Path, project_type: str, project_name: str, o
         if out_dir.exists() and out_dir.is_dir():
             shutil.rmtree(out_dir)
         shutil.move(str(staging), str(out_dir))
-        _write_project_config(out_dir, project_type, project_name, arch, publisher)
+        _ensure_deps_layout(out_dir)
+        if include_msvc_dlls:
+            _copy_msvc_dlls(out_dir, arch)
+        _write_project_config(out_dir, project_type, project_name, arch, publisher, include_msvc_dlls)
         _write_project_readme(out_dir, project_name, project_type)
         _write_install_script(out_dir, project_name)
         _success(f"Project created: {out_dir}")
@@ -567,6 +613,7 @@ def edit_project_config(config_path: Path) -> None:
     images = data.get('images', {}) or {}
     icon_path = images.get('icon', '')
     banner_path = images.get('banner', '')
+    include_msvc_dlls = bool(data.get('includeMsvcDlls', False))
     manifest_paths = _get_manifest_paths(project_dir)
     current_caps = set()
     if manifest_paths:
@@ -577,6 +624,7 @@ def edit_project_config(config_path: Path) -> None:
     resources_dir = _prompt("Resources directory", resources_dir)
     icon_path = _prompt("Icon image path (optional)", icon_path)
     banner_path = _prompt("Banner image path (optional)", banner_path)
+    include_msvc = _prompt("Include MSVC DLLs (yes/no)", "yes" if include_msvc_dlls else "no").lower() in ("y", "yes", "true", "1")
     selected_caps = _prompt_capabilities(current_caps)
 
     data['name'] = name
@@ -589,6 +637,7 @@ def edit_project_config(config_path: Path) -> None:
         'banner': banner_path
     }
     data['capabilities'] = sorted(selected_caps)
+    data['includeMsvcDlls'] = include_msvc
 
     _save_config(config_path, data)
     _update_metadata(project_dir, arch)
@@ -596,6 +645,9 @@ def edit_project_config(config_path: Path) -> None:
     if manifest_paths:
         _update_manifest_capabilities(project_dir, selected_caps)
     _sync_images(project_dir, resources_dir, icon_path, banner_path)
+    if include_msvc and project_dir.exists():
+        _ensure_deps_layout(project_dir)
+        _copy_msvc_dlls(project_dir, arch)
     _success(f"✅ Updated config: {config_path}")
 
 def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arch: str, default_publisher: str, images_dir: Path):
@@ -608,7 +660,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
 
     root = tk.Tk()
     root.title("MinGW UWP Project Generator")
-    root.geometry("640x420")
+    root.geometry("640x450")
     root.resizable(False, False)
 
     header = ttk.Label(root, text="Create a new MinGW UWP project", font=("Segoe UI", 14, "bold"))
@@ -653,6 +705,9 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     overwrite_var = tk.BooleanVar(value=False)
     overwrite_check = ttk.Checkbutton(frame, text="Overwrite output directory if it exists", variable=overwrite_var)
 
+    include_msvc_var = tk.BooleanVar(value=False)
+    include_msvc_check = ttk.Checkbutton(frame, text="Include MSVC DLLs in deps/bin", variable=include_msvc_var)
+
     add_row(0, "Project type", project_type)
     add_row(1, "Project name", name_entry)
     add_row(2, "Output directory", output_entry, output_button)
@@ -660,6 +715,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     add_row(4, "Architecture", arch_combo)
     add_row(5, "Publisher", publisher_entry)
     overwrite_check.grid(row=6, column=1, sticky="w", pady=(10, 6))
+    include_msvc_check.grid(row=7, column=1, sticky="w", pady=(0, 6))
 
     button_frame = ttk.Frame(root, padding=(16, 0, 16, 16))
     button_frame.pack(fill=tk.X)
@@ -684,6 +740,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
                 publisher=publisher_var.get().strip() or default_publisher,
                 reuse_images=images_dir,
                 overwrite=overwrite_var.get(),
+                include_msvc_dlls=include_msvc_var.get(),
             )
         except Exception as exc:
             messagebox.showerror("Generation failed", str(exc))
@@ -776,6 +833,8 @@ def edit_project_config_gui(config_path: Path) -> None:
     banner_entry = ttk.Entry(frame, textvariable=banner_var)
     banner_button = ttk.Button(frame, text="Browse", command=lambda: banner_var.set(filedialog.askopenfilename() or banner_var.get()))
 
+    include_msvc_var = tk.BooleanVar(value=bool(data.get('includeMsvcDlls', False)))
+
     add_row(0, "Project name", name_entry)
     add_row(1, "Project directory", project_dir_entry)
     add_row(2, "Architecture", arch_combo)
@@ -783,9 +842,10 @@ def edit_project_config_gui(config_path: Path) -> None:
     add_row(4, "Resources directory", resources_entry, resources_button)
     add_row(5, "Icon image", icon_entry, icon_button)
     add_row(6, "Banner image", banner_entry, banner_button)
+    ttk.Checkbutton(frame, text="Include MSVC DLLs in deps/bin", variable=include_msvc_var).grid(row=7, column=1, sticky="w", pady=(4, 6))
 
     cap_frame = ttk.Labelframe(frame, text="Capabilities", padding=12)
-    cap_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+    cap_frame.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(10, 6))
     cap_frame.columnconfigure(0, weight=1)
     cap_frame.columnconfigure(1, weight=1)
 
@@ -798,7 +858,7 @@ def edit_project_config_gui(config_path: Path) -> None:
         ttk.Checkbutton(cap_frame, text=cap, variable=cap_vars[cap]).grid(row=row, column=col, sticky="w", padx=4, pady=2)
 
     optional_frame = ttk.Labelframe(frame, text="Optional capabilities", padding=12)
-    optional_frame.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(6, 6))
+    optional_frame.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(6, 6))
     optional_frame.columnconfigure(1, weight=1)
 
     optional_selected = [cap for cap in OPTIONAL_CAPS if cap in current_caps]
@@ -847,6 +907,7 @@ def edit_project_config_gui(config_path: Path) -> None:
             'icon': icon_var.get().strip(),
             'banner': banner_var.get().strip()
         }
+        updated['includeMsvcDlls'] = bool(include_msvc_var.get())
 
         selected_caps = {cap for cap, var in cap_vars.items() if var.get()}
         selected_caps.update(optional_list.get(0, tk.END))
@@ -858,6 +919,9 @@ def edit_project_config_gui(config_path: Path) -> None:
         if manifest_paths:
             _update_manifest_capabilities(project_dir, set(selected_caps))
         _sync_images(project_dir, updated['resourcesDir'], updated['images']['icon'], updated['images']['banner'])
+        if updated['includeMsvcDlls'] and project_dir.exists():
+            _ensure_deps_layout(project_dir)
+            _copy_msvc_dlls(project_dir, updated['arch'])
 
         messagebox.showinfo("Saved", f"Updated config: {config_path}")
         root.destroy()
@@ -876,6 +940,7 @@ def main():
     parser.add_argument('--arch', default='x64', help='Target architecture (x64/x86/arm64/arm)')
     parser.add_argument('--publisher', default='CN=Unknown', help='Publisher CN for manifest')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite output directory if it exists')
+    parser.add_argument('--include-msvc-dlls', action='store_true', help='Copy MSVC runtime DLLs into deps/bin')
 
     force_cli = '--cli' in sys.argv
     if force_cli:
@@ -912,7 +977,7 @@ def main():
     out_dir = Path(args.output_dir).resolve() / args.name
     images_dir = repo_root / 'Images'
 
-    generate_project(template_dir, args.type, args.name, out_dir, args.arch, args.publisher, images_dir, args.overwrite)
+    generate_project(template_dir, args.type, args.name, out_dir, args.arch, args.publisher, images_dir, args.overwrite, args.include_msvc_dlls)
 
 if __name__ == '__main__':
     main()

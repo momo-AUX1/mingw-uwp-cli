@@ -18,3 +18,14 @@ endif()
 add_executable(${PROJECT_NAME}
   main.cpp
 )
+
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/deps/include")
+  target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/deps/include")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/deps/bin")
+  file(GLOB _deps_bins "${CMAKE_CURRENT_LIST_DIR}/deps/bin/*")
+  if(_deps_bins)
+    file(COPY ${_deps_bins} DESTINATION ${CMAKE_BINARY_DIR})
+  endif()
+endif()

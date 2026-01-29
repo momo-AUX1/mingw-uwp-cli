@@ -40,6 +40,13 @@ message(STATUS "Building for ${APPX_ARCHITECTURE}.")
 file(COPY Images MainPage.xaml DESTINATION ${CMAKE_BINARY_DIR})
 configure_file(AppxManifest.in AppxManifest.xml)
 
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/deps/bin")
+  file(GLOB _deps_bins "${CMAKE_CURRENT_LIST_DIR}/deps/bin/*")
+  if(_deps_bins)
+    file(COPY ${_deps_bins} DESTINATION ${CMAKE_BINARY_DIR})
+  endif()
+endif()
+
 if(NOT MSVC)
   include(FetchContent)
   set(MINGW_USE_WINRT ON)
@@ -70,6 +77,10 @@ add_executable(${PROJECT_NAME} WIN32
   App.cpp
   MainPage.cpp
 )
+
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/deps/include")
+  target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/deps/include")
+endif()
 
 if(NOT MSVC)
   if(APPX_ARCHITECTURE STREQUAL "x64")
