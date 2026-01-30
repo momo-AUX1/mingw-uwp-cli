@@ -868,6 +868,47 @@ def _collect_runtime_logs(identity_name: str, minutes: int = 10) -> str:
     _, output = _run_powershell(script)
     return output.strip()
 
+def _collect_debug_output(identity_name: str, minutes: int = 10) -> str:
+    if not WINDOWS:
+        return "Debug output collection is only available on Windows."
+    if not identity_name:
+        return "Package identity not found; cannot filter debug output."
+    script = (
+        "$pkg = Get-AppxPackage -Name \"{name}\" | Select-Object -First 1;"
+        "if (-not $pkg) {{ Write-Output \"Package not found for identity.\"; exit 0 }};"
+        "$family = [regex]::Escape($pkg.PackageFamilyName);"
+        "$logs = @('Microsoft-Windows-AppModel-Runtime/Debug','Microsoft-Windows-Diagnostics-Logging/Operational');"
+        "$events = @();"
+        "foreach ($log in $logs) {{"
+        "  try {{"
+        "    $events += Get-WinEvent -FilterHashtable @{{LogName=$log; StartTime=(Get-Date).AddMinutes(-{minutes})}} "
+        "      | Where-Object {{ $_.Message -match $family }};"
+        "  }} catch {{ }}"
+        "}};"
+        "if (-not $events) {{ Write-Output \"No recent debug output found. Ensure debug logs are enabled.\"; exit 0 }};"
+        "$events | Select-Object -First 50 | Format-List TimeCreated, Id, Message"
+    ).format(name=identity_name.replace('"', '\\"'), minutes=minutes)
+    _, output = _run_powershell(script)
+    return output.strip()
+
+def _collect_crash_logs(identity_name: str, minutes: int = 60) -> str:
+    if not WINDOWS:
+        return "Crash log collection is only available on Windows."
+    if not identity_name:
+        return "Package identity not found; cannot filter crash logs."
+    script = (
+        "$pkg = Get-AppxPackage -Name \"{name}\" | Select-Object -First 1;"
+        "if (-not $pkg) {{ Write-Output \"Package not found for identity.\"; exit 0 }};"
+        "$family = [regex]::Escape($pkg.PackageFamilyName);"
+        "$events = Get-WinEvent -FilterHashtable @{{LogName='Microsoft-Windows-AppModel-Runtime/Admin'; StartTime=(Get-Date).AddMinutes(-{minutes})}} "
+        "| Where-Object {{ ($_.LevelDisplayName -in @('Error','Critical')) -and $_.Message -match $family }} "
+        "| Select-Object -First 50;"
+        "if (-not $events) {{ Write-Output \"No recent crash events found.\"; exit 0 }};"
+        "$events | Format-List TimeCreated, Id, LevelDisplayName, Message"
+    ).format(name=identity_name.replace('"', '\\"'), minutes=minutes)
+    _, output = _run_powershell(script)
+    return output.strip()
+
 def _register_appx(manifest_path: Path) -> tuple[bool, str]:
     command = f"Add-AppxPackage -Register \"{manifest_path}\" -Verbose -ErrorAction Stop"
     code, output = _run_powershell(command, cwd=manifest_path.parent)
@@ -2254,7 +2295,9 @@ def edit_project_config_gui(config_path: Path, parent=None) -> None:
         root.mainloop()
 
 def _run_makemsix_cli(argv) -> None:
-    parser = argparse.ArgumentParser(description="Package MSIX using makemsix")
+    parser = argparse.ArgumentParser(
+        description="Package MSIX using makemsix (requires pack-capable build)."
+    )
     parser.add_argument("build_dir", help="Directory containing AppxManifest.xml")
     parser.add_argument("-o", "--output", default="", help="Output .msix path (optional)")
     parser.add_argument("--makemsix", default="", help="Path to makemsix executable (optional)")
@@ -2282,11 +2325,22 @@ def _run_makemsix_cli(argv) -> None:
     sys.exit(1)
 
 def _run_install_cli(argv) -> None:
-    parser = argparse.ArgumentParser(description="Run or deploy a loose Appx build")
+    parser = argparse.ArgumentParser(
+        description="Run/register loose builds or install MSIX/AppX packages.",
+        epilog=(
+            "Remote deploy requires --json with ip/username/password under devicePortal.\n"
+            "Loose remote deploy requires a UNC path (\\\\host\\share\\path)."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument("build_dir", help="Directory containing AppxManifest.xml")
     parser.add_argument("--no-launch", action="store_true", help="Do not launch after registering")
     parser.add_argument("--remote", action="store_true", help="Deploy to a remote device portal")
     parser.add_argument("--json", default="", help="Path to mingw_winrt.json with device portal credentials")
+    parser.add_argument("--logs", action="store_true", help="Print recent runtime logs after install/run")
+    parser.add_argument("--debug", action="store_true", help="Print recent debug output (Windows only)")
+    parser.add_argument("--crashes", action="store_true", help="Print recent crash events (Windows only)")
+    parser.add_argument("--minutes", type=int, default=10, help="Minutes to look back for logs (default 10)")
     args = parser.parse_args(argv)
 
     build_dir = Path(args.build_dir).expanduser().resolve()
@@ -2371,10 +2425,27 @@ def _run_install_cli(argv) -> None:
         sys.exit(1)
     _success("Registration completed.")
 
+    identity_name, app_id = _read_manifest_identity(manifest_path)
+
     if args.no_launch:
+        if args.logs or args.debug or args.crashes:
+            if args.logs:
+                logs = _collect_runtime_logs(identity_name, minutes=args.minutes)
+                if logs:
+                    print("\n=== Runtime Logs ===")
+                    print(logs)
+            if args.debug:
+                debug_logs = _collect_debug_output(identity_name, minutes=args.minutes)
+                if debug_logs:
+                    print("\n=== Debug Output ===")
+                    print(debug_logs)
+            if args.crashes:
+                crash_logs = _collect_crash_logs(identity_name, minutes=max(args.minutes, 10))
+                if crash_logs:
+                    print("\n=== Crash Logs ===")
+                    print(crash_logs)
         return
 
-    identity_name, app_id = _read_manifest_identity(manifest_path)
     _info("Launching app...")
     launch_ok, launch_output = _launch_app(identity_name, app_id)
     if launch_output:
@@ -2383,10 +2454,30 @@ def _run_install_cli(argv) -> None:
         _error("Failed to launch app.")
         sys.exit(1)
 
-    logs = _collect_runtime_logs(identity_name, minutes=10)
-    if logs:
-        print("\n=== Runtime Logs ===")
-        print(logs)
+    if not (args.logs or args.debug or args.crashes):
+        logs = _collect_runtime_logs(identity_name, minutes=10)
+        if logs:
+            print("\n=== Runtime Logs ===")
+            print(logs)
+        return
+
+    if args.logs:
+        logs = _collect_runtime_logs(identity_name, minutes=args.minutes)
+        if logs:
+            print("\n=== Runtime Logs ===")
+            print(logs)
+
+    if args.debug:
+        debug_logs = _collect_debug_output(identity_name, minutes=args.minutes)
+        if debug_logs:
+            print("\n=== Debug Output ===")
+            print(debug_logs)
+
+    if args.crashes:
+        crash_logs = _collect_crash_logs(identity_name, minutes=max(args.minutes, 10))
+        if crash_logs:
+            print("\n=== Crash Logs ===")
+            print(crash_logs)
 
 def main():
     parser = argparse.ArgumentParser(description='Generate MinGW UWP projects (loose files)')
