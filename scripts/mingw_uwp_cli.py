@@ -167,11 +167,21 @@ Outputs will be in `build/{project_name}.appx` or `build/{project_name}.msix`.
 ## Install
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Package .\build\{project_name}.appx
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Package .\ build\{project_name}.appx
 ```
 
 If you have the Windows 10/11 SDK installed, `makeappx.exe` is used for packaging.
 {extra_install}
+
+## Troubleshooting (macOS/Linux cross-build)
+
+If you build with MinGW GCC 15 on macOS/Linux and see a coroutine_handle error in WinRT headers, reconfigure with:
+
+```powershell
+cmake -S . -B build -DMINGW_WINRT_COROUTINE_ALIAS_FIX=ON
+```
+
+This applies a build-directory-only workaround. Windows builds do not need it.
 """
     (out_dir / 'README.md').write_text(readme, encoding='utf-8')
 
