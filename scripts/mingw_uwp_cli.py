@@ -9,7 +9,11 @@ import base64
 import ssl
 import urllib.request
 import urllib.error
+import urllib.parse
 import webbrowser
+import threading
+import socket
+import http.client
 from pathlib import Path
 import re
 import json
@@ -360,8 +364,7 @@ def _write_project_config(out_dir: Path, project_type: str, project_name: str, a
         DEVICE_PORTAL_KEY: {
             'ip': '',
             'username': '',
-            'password': '',
-            'networkShare': ''
+            'password': ''
         },
         'capabilities': [],
         'includeMsvcDlls': include_msvc_dlls,
@@ -484,6 +487,22 @@ def _save_device_portal_settings(config_path: Optional[Path], settings: dict) ->
     data[DEVICE_PORTAL_KEY] = settings
     _save_config(config_path, data)
 
+def _load_device_portal_from_json(json_path: Path) -> dict:
+    data = _load_config_safe(json_path)
+    if not isinstance(data, dict):
+        return {}
+    if DEVICE_PORTAL_KEY in data and isinstance(data[DEVICE_PORTAL_KEY], dict):
+        portal = data.get(DEVICE_PORTAL_KEY, {})
+    else:
+        portal = data
+    if not isinstance(portal, dict):
+        return {}
+    return {
+        "ip": portal.get("ip", ""),
+        "username": portal.get("username", ""),
+        "password": portal.get("password", ""),
+    }
+
 def _load_tool_db() -> dict:
     if not TOOL_DB_PATH.exists():
         return {}
@@ -545,6 +564,130 @@ def _run_makemsix(tool_path: str, build_dir: Path, output_path: Path) -> tuple[b
         return False, (normalized + "\n" + hint).strip()
     return False, normalized or f"makemsix failed with exit code {completed.returncode}."
 
+def _install_msix_local(package_path: Path) -> tuple[bool, str]:
+    if not WINDOWS:
+        return False, "MSIX installation is only available on Windows."
+    if not package_path.exists():
+        return False, f"Package not found: {package_path}"
+    command = f"Add-AppxPackage -Path \"{package_path}\" -ErrorAction Stop"
+    code, output = _run_powershell(command)
+    if code == 0:
+        return True, output.strip()
+    return False, output.strip()
+
+def _build_multipart_files(parts: list[tuple[str, Path]]) -> tuple[bytes, str]:
+    boundary = f"----codex{uuid.uuid4().hex}"
+    body = bytearray()
+    for field_name, file_path in parts:
+        header = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_path.name}\"\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8")
+        body.extend(header)
+        body.extend(file_path.read_bytes())
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    return bytes(body), boundary
+
+def _multipart_content_length(parts: list[tuple[str, Path]], boundary: str) -> int:
+    total = 0
+    for field_name, file_path in parts:
+        header = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_path.name}\"\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8")
+        total += len(header)
+        total += file_path.stat().st_size
+        total += len(b"\r\n")
+    total += len(f"--{boundary}--\r\n".encode("utf-8"))
+    return total
+
+def _send_multipart_stream(conn: http.client.HTTPConnection, parts: list[tuple[str, Path]], boundary: str) -> None:
+    for field_name, file_path in parts:
+        header = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_path.name}\"\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8")
+        conn.send(header)
+        with file_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        conn.send(b"\r\n")
+    conn.send(f"--{boundary}--\r\n".encode("utf-8"))
+
+def _collect_dependencies_for_package(package_path: Path) -> list[Path]:
+    deps_dir = package_path.parent / "Dependencies"
+    if not deps_dir.exists() or not deps_dir.is_dir():
+        return []
+    x64_dir = deps_dir / "x64"
+    search_root = x64_dir if x64_dir.exists() and x64_dir.is_dir() else deps_dir
+    deps = []
+    for dep in search_root.glob("*.appx"):
+        if dep.is_file():
+            deps.append(dep)
+    return deps
+
+def _deploy_msix_remote(package_path: Path, host: str, username: str, password: str) -> tuple[bool, str]:
+    if not package_path.exists():
+        return False, f"Package not found: {package_path}"
+    base_url = _normalize_wdp_host(host)
+    if not base_url:
+        return False, "Device IP/host is required."
+    encoded_name = urllib.parse.quote(package_path.name)
+    url = f"{base_url}/api/app/packagemanager/package?package={encoded_name}"
+    dependencies = _collect_dependencies_for_package(package_path)
+    parts = [("package", package_path)]
+    for dep in dependencies:
+        parts.append(("dependency", dep))
+    boundary = f"----codex{uuid.uuid4().hex}"
+    content_length = _multipart_content_length(parts, boundary)
+
+    parsed = urllib.parse.urlparse(url)
+    context = ssl._create_unverified_context()
+    try:
+        conn = http.client.HTTPSConnection(
+            parsed.hostname,
+            parsed.port or 443,
+            context=context,
+            timeout=240,
+        )
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        conn.putrequest("POST", path)
+        conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        conn.putheader("Content-Length", str(content_length))
+        if username or password:
+            token = base64.b64encode(f"{username}:{password}".encode('utf-8')).decode('ascii')
+            conn.putheader("Authorization", f"Basic {token}")
+        conn.endheaders()
+        _send_multipart_stream(conn, parts, boundary)
+        response = conn.getresponse()
+        status = response.status
+        payload = response.read().decode('utf-8', errors='ignore').strip()
+        conn.close()
+        if status in (200, 202):
+            if dependencies:
+                payload = (payload + f"\nIncluded dependencies: {len(dependencies)}").strip()
+            return True, payload or "Install request accepted."
+        if dependencies:
+            payload = (payload + f"\nIncluded dependencies: {len(dependencies)}").strip()
+        return False, payload or f"Deploy failed with status {status}."
+    except (socket.timeout, TimeoutError) as exc:
+        size_mb = content_length / (1024 * 1024)
+        return False, f"Upload timed out while sending {size_mb:.1f} MB. The portal may be slow; try wired or smaller packages. ({exc})"
+    except OSError as exc:
+        if "timed out" in str(exc).lower():
+            size_mb = content_length / (1024 * 1024)
+            return False, f"Upload timed out while sending {size_mb:.1f} MB. The portal may be slow; try wired or smaller packages. ({exc})"
+        return False, f"Deploy failed: {exc}"
+    except Exception as exc:
+        return False, f"Deploy failed: {exc}"
+
 def _run_osslsigncode(tool_path: str, cert_path: Path, password: str, name: str, input_msix: Path, output_msix: Path) -> tuple[bool, str]:
     if not cert_path.exists():
         return False, f"PFX not found: {cert_path}"
@@ -569,6 +712,39 @@ def _run_osslsigncode(tool_path: str, cert_path: Path, password: str, name: str,
     if completed.returncode == 0:
         return True, output.strip()
     return False, output.strip() or f"osslsigncode failed with exit code {completed.returncode}."
+
+def _create_pfx_with_openssl(key_path: Path, cert_path: Path, days: int, subject: str, output_path: Path, password: str) -> tuple[bool, str]:
+    openssl_path = shutil.which("openssl")
+    if not openssl_path:
+        return False, "OpenSSL not found. Install OpenSSL and try again."
+    if not subject:
+        return False, "Certificate subject is required (example: CN=Unknown)."
+    if not password:
+        return False, "PFX password is required."
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    req_cmd = [
+        openssl_path, "req", "-x509", "-newkey", "rsa:2048",
+        "-nodes", "-keyout", str(key_path), "-out", str(cert_path),
+        "-days", str(days), "-subj", f"/{subject}"
+    ]
+    req_completed = subprocess.run(req_cmd, capture_output=True, text=True)
+    if req_completed.returncode != 0:
+        output = (req_completed.stdout or "") + (req_completed.stderr or "")
+        return False, output.strip() or "OpenSSL certificate creation failed."
+    pfx_cmd = [
+        openssl_path, "pkcs12", "-export",
+        "-out", str(output_path),
+        "-inkey", str(key_path),
+        "-in", str(cert_path),
+        "-passout", f"pass:{password}",
+    ]
+    pfx_completed = subprocess.run(pfx_cmd, capture_output=True, text=True)
+    output = (pfx_completed.stdout or "") + (pfx_completed.stderr or "")
+    if pfx_completed.returncode == 0:
+        return True, output.strip() or "PFX created."
+    return False, output.strip() or "OpenSSL PFX export failed."
 
 def _create_self_signed_pfx(subject: str, password: str, output_path: Path) -> tuple[bool, str]:
     if not subject:
@@ -1070,10 +1246,50 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     nav.grid(row=1, column=0, sticky="ns")
     nav.columnconfigure(0, weight=1)
 
-    content = ttk.Frame(main, style="Content.TFrame", padding=(16, 16))
-    content.grid(row=1, column=1, sticky="nsew")
+    content_container = ttk.Frame(main, style="Content.TFrame")
+    content_container.grid(row=1, column=1, sticky="nsew")
+    content_container.columnconfigure(0, weight=1)
+    content_container.rowconfigure(0, weight=1)
+
+    content_canvas = tk.Canvas(content_container, background=colors["bg"], highlightthickness=0)
+    content_scroll = ttk.Scrollbar(content_container, orient=tk.VERTICAL, command=content_canvas.yview)
+    content_canvas.configure(yscrollcommand=content_scroll.set)
+    content_canvas.grid(row=0, column=0, sticky="nsew")
+    content_scroll.grid(row=0, column=1, sticky="ns")
+
+    content = ttk.Frame(content_canvas, style="Content.TFrame", padding=(16, 16))
+    content_id = content_canvas.create_window((0, 0), window=content, anchor="nw")
     content.columnconfigure(0, weight=1)
-    content.rowconfigure(0, weight=1)
+
+    def _on_content_configure(event):
+        content_canvas.configure(scrollregion=content_canvas.bbox("all"))
+
+    def _on_canvas_configure(event):
+        content_canvas.itemconfigure(content_id, width=event.width)
+
+    content.bind("<Configure>", _on_content_configure)
+    content_canvas.bind("<Configure>", _on_canvas_configure)
+
+    def _on_mousewheel(event):
+        if event.delta:
+            content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif event.num == 4:
+            content_canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            content_canvas.yview_scroll(3, "units")
+
+    def _bind_mousewheel(_):
+        content_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        content_canvas.bind_all("<Button-4>", _on_mousewheel)
+        content_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+    def _unbind_mousewheel(_):
+        content_canvas.unbind_all("<MouseWheel>")
+        content_canvas.unbind_all("<Button-4>")
+        content_canvas.unbind_all("<Button-5>")
+
+    content_canvas.bind("<Enter>", _bind_mousewheel)
+    content_canvas.bind("<Leave>", _unbind_mousewheel)
 
     pages = {}
     nav_buttons = {}
@@ -1084,6 +1300,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         pages[name].grid(row=0, column=0, sticky="nsew")
         for key, button in nav_buttons.items():
             button.configure(style="NavActive.TButton" if key == name else "Nav.TButton")
+        content_canvas.yview_moveto(0)
 
     def add_nav_button(name: str, text: str):
         button = ttk.Button(nav, text=text, style="Nav.TButton", command=lambda: show_page(name))
@@ -1248,7 +1465,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     # Runner / Installer Page
     runner_page = ttk.Frame(content, style="Content.TFrame")
     runner_page.columnconfigure(0, weight=1)
-    runner_page.rowconfigure(3, weight=1)
+    runner_page.rowconfigure(4, weight=1)
 
     runner_header_row = ttk.Frame(runner_page, style="Content.TFrame")
     runner_header_row.grid(row=0, column=0, sticky="ew")
@@ -1256,17 +1473,20 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     runner_header_row.columnconfigure(1, weight=0)
     runner_header = ttk.Label(runner_header_row, text="Run / Install loose apps", style="Header.TLabel")
     runner_header.grid(row=0, column=0, sticky="w")
-    runner_hint = ttk.Label(runner_header_row, text="Register AppxManifest.xml locally or deploy to a device portal share.", style="Muted.TLabel")
+    runner_hint = ttk.Label(runner_header_row, text="Register loose builds, install MSIX packages, or deploy via device portal.", style="Muted.TLabel")
     runner_hint.grid(row=0, column=1, sticky="e")
 
-    local_card = create_card(runner_page, "Local register & run")
-    local_card.grid(row=1, column=0, sticky="ew", pady=(12, 8))
+    settings_card = create_card(runner_page, "Device portal settings")
+    settings_card.grid(row=1, column=0, sticky="ew", pady=(12, 8))
 
-    device_card = create_card(runner_page, "Remote device portal (loose folder)")
-    device_card.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+    local_card = create_card(runner_page, "Loose folder (local + remote)")
+    local_card.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+
+    msix_card = create_card(runner_page, "MSIX install / deploy")
+    msix_card.grid(row=3, column=0, sticky="ew", pady=(0, 12))
 
     log_card = create_card(runner_page, "Output")
-    log_card.grid(row=3, column=0, sticky="nsew")
+    log_card.grid(row=4, column=0, sticky="nsew")
     log_card.columnconfigure(0, weight=1)
     log_card.rowconfigure(0, weight=1)
 
@@ -1284,7 +1504,34 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         log_text.see(tk.END)
         log_text.configure(state="disabled")
 
+    def append_log_async(message: str):
+        root.after(0, lambda: append_log(message))
+
+    def run_async(task, done_label: Optional[str] = None):
+        def _runner():
+            try:
+                task()
+            finally:
+                if done_label:
+                    append_log_async(done_label)
+        threading.Thread(target=_runner, daemon=True).start()
+
     current_manifest = {"path": None, "identity": "", "app_id": "", "config": None}
+    settings_config_state = {"path": None}
+    settings_config_var = tk.StringVar(value="")
+
+    def set_settings_config(path: Optional[Path]):
+        settings_config_state["path"] = path
+        settings_config_var.set(str(path.parent) if path else "")
+        if not path:
+            ip_var.set("")
+            username_var.set("")
+            password_var.set("")
+            return
+        portal = _read_device_portal_settings(path)
+        ip_var.set(portal.get("ip", ""))
+        username_var.set(portal.get("username", ""))
+        password_var.set(portal.get("password", ""))
 
     def update_manifest_state(path: Optional[Path]):
         current_manifest["path"] = None
@@ -1305,11 +1552,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         config_path = _resolve_project_config_for_dir(path)
         current_manifest["config"] = config_path
         manifest_status.set(f"Manifest OK: {manifest_path.name}")
-        portal = _read_device_portal_settings(config_path)
-        ip_var.set(portal.get("ip", ""))
-        username_var.set(portal.get("username", ""))
-        password_var.set(portal.get("password", ""))
-        network_share_var.set(portal.get("networkShare", ""))
+        set_settings_config(config_path)
 
     def browse_build_dir():
         path = filedialog.askdirectory()
@@ -1344,53 +1587,140 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
 
     add_row(local_card, 0, "Build folder", build_dir_entry, ttk.Button(local_card, text="Browse", style="Ghost.TButton", command=browse_build_dir))
     manifest_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    def deploy_loose():
+        share_path = build_dir_var.get().strip()
+        if not share_path:
+            messagebox.showerror("Missing folder", "Select a build folder first.")
+            return
+        if not (share_path.startswith("\\\\") or share_path.startswith("//")):
+            messagebox.showerror("Missing network share", "Remote deploy requires a UNC path (e.g. \\\\host\\share\\path).")
+            return
+        if not save_portal_settings():
+            return
+        append_log("== Deploying loose folder to device portal ==")
+
+        def _task():
+            ok, output = _deploy_loose_remote(
+                share_path,
+                ip_var.get().strip(),
+                username_var.get().strip(),
+                password_var.get().strip(),
+            )
+            if output:
+                append_log_async(output)
+            append_log_async("Remote deploy accepted." if ok else "Remote deploy failed.")
+
+        run_async(_task)
+
     ttk.Checkbutton(local_card, text="Launch after register", variable=launch_after_var).grid(row=2, column=0, sticky="w", pady=(0, 6))
     ttk.Button(local_card, text="Register & Run", style="Accent.TButton", command=register_and_run).grid(row=2, column=2, sticky="e")
+    ttk.Button(local_card, text="Deploy to Device", style="Ghost.TButton", command=deploy_loose).grid(row=3, column=2, sticky="e", pady=(0, 6))
+
+    msix_path_var = tk.StringVar(value="")
+    msix_status = tk.StringVar(value="Select a .msix/.appx package to install or deploy.")
+
+    def update_msix_status(path: Optional[Path]):
+        if not path:
+            msix_status.set("Select a .msix/.appx package to install or deploy.")
+            return
+        if not path.exists():
+            msix_status.set("Package not found.")
+            return
+        msix_status.set(f"Package OK: {path.name}")
+
+    def browse_msix():
+        path = filedialog.askopenfilename(filetypes=[("MSIX/AppX packages", "*.msix *.msixbundle *.appx *.appxbundle"), ("All files", "*.*")])
+        if path:
+            msix_path_var.set(path)
+            update_msix_status(Path(path))
+
+    def install_msix():
+        path_text = msix_path_var.get().strip()
+        if not path_text:
+            messagebox.showerror("Missing package", "Select a package file first.")
+            return
+        package_path = Path(path_text).expanduser().resolve()
+        append_log("== Installing MSIX locally ==")
+        ok, output = _install_msix_local(package_path)
+        if output:
+            append_log(output)
+        if ok:
+            append_log("MSIX install started.")
+        else:
+            append_log("MSIX install failed.")
+
+    def deploy_msix():
+        path_text = msix_path_var.get().strip()
+        if not path_text:
+            messagebox.showerror("Missing package", "Select a package file first.")
+            return
+        if not save_portal_settings():
+            return
+        package_path = Path(path_text).expanduser().resolve()
+        append_log("== Deploying MSIX to device portal ==")
+
+        def _task():
+            ok, output = _deploy_msix_remote(
+                package_path,
+                ip_var.get().strip(),
+                username_var.get().strip(),
+                password_var.get().strip(),
+            )
+            if output:
+                append_log_async(output)
+            append_log_async("Remote install accepted." if ok else "Remote install failed.")
+
+        run_async(_task)
+
+    add_row(msix_card, 0, "Package file", ttk.Entry(msix_card, textvariable=msix_path_var), ttk.Button(msix_card, text="Browse", style="Ghost.TButton", command=browse_msix))
+    ttk.Label(msix_card, textvariable=msix_status, style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    msix_actions = ttk.Frame(msix_card, style="Content.TFrame")
+    msix_actions.grid(row=2, column=0, columnspan=3, sticky="e", pady=(0, 6))
+    ttk.Button(msix_actions, text="Install locally", style="Accent.TButton", command=install_msix).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(msix_actions, text="Deploy to device", style="Ghost.TButton", command=deploy_msix).grid(row=0, column=1)
 
     ip_var = tk.StringVar(value="")
     username_var = tk.StringVar(value="")
     password_var = tk.StringVar(value="")
-    network_share_var = tk.StringVar(value="")
 
     update_manifest_state(Path(build_dir_var.get()))
 
-    add_row(device_card, 0, "Device IP / host", ttk.Entry(device_card, textvariable=ip_var))
-    add_row(device_card, 1, "Username", ttk.Entry(device_card, textvariable=username_var))
-    add_row(device_card, 2, "Password", ttk.Entry(device_card, textvariable=password_var, show="*"))
-    add_row(device_card, 3, "Network share (\\\\host\\share\\path)", ttk.Entry(device_card, textvariable=network_share_var))
+    def load_settings_config():
+        selected = settings_config_var.get().strip()
+        if not selected:
+            selected = filedialog.askdirectory()
+        if not selected:
+            return
+        candidate = Path(selected).expanduser().resolve()
+        if candidate.is_file() and candidate.name == DEFAULT_CONFIG_NAME:
+            config_path = candidate
+        else:
+            config_path = candidate / DEFAULT_CONFIG_NAME
+        if not config_path.exists():
+            messagebox.showerror("Config not found", f"Missing {DEFAULT_CONFIG_NAME} in {candidate}")
+            return
+        set_settings_config(config_path)
+
+    add_row(settings_card, 0, "Project folder", ttk.Entry(settings_card, textvariable=settings_config_var), ttk.Button(settings_card, text="Load", style="Ghost.TButton", command=load_settings_config))
+    add_row(settings_card, 1, "Device IP / host", ttk.Entry(settings_card, textvariable=ip_var))
+    add_row(settings_card, 2, "Username", ttk.Entry(settings_card, textvariable=username_var))
+    add_row(settings_card, 3, "Password", ttk.Entry(settings_card, textvariable=password_var, show="*"))
 
     def save_portal_settings():
+        if not settings_config_state["path"]:
+            messagebox.showerror("Missing config", "Load a project folder with mingw_winrt.json first.")
+            return False
         settings = {
             "ip": ip_var.get().strip(),
             "username": username_var.get().strip(),
             "password": password_var.get().strip(),
-            "networkShare": network_share_var.get().strip(),
         }
-        _save_device_portal_settings(current_manifest.get("config"), settings)
+        _save_device_portal_settings(settings_config_state["path"], settings)
+        return True
 
-    def deploy_remote():
-        if not current_manifest["path"]:
-            messagebox.showerror("Missing manifest", "Select a build folder with AppxManifest.xml first.")
-            return
-        save_portal_settings()
-        append_log("== Deploying loose folder to device portal ==")
-        ok, output = _deploy_loose_remote(
-            network_share_var.get().strip(),
-            ip_var.get().strip(),
-            username_var.get().strip(),
-            password_var.get().strip(),
-        )
-        if output:
-            append_log(output)
-        if ok:
-            append_log("Remote deploy accepted.")
-        else:
-            append_log("Remote deploy failed.")
-
-    actions_row = ttk.Frame(device_card, style="Content.TFrame")
-    actions_row.grid(row=4, column=0, columnspan=3, sticky="e", pady=(10, 0))
-    ttk.Button(actions_row, text="Save Settings", style="Ghost.TButton", command=save_portal_settings).grid(row=0, column=0, padx=(0, 8))
-    ttk.Button(actions_row, text="Deploy to Device", style="Accent.TButton", command=deploy_remote).grid(row=0, column=1)
+    settings_actions = ttk.Frame(settings_card, style="Content.TFrame")
+    settings_actions.grid(row=4, column=0, columnspan=3, sticky="e", pady=(10, 0))
+    ttk.Button(settings_actions, text="Save Settings", style="Ghost.TButton", command=save_portal_settings).grid(row=0, column=0)
 
     log_text = tk.Text(log_card, height=10, background=colors["panel"], foreground=colors["text"], insertbackground=colors["text"], borderwidth=0)
     log_text.configure(state="disabled")
@@ -1581,24 +1911,96 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         signing_log_text.configure(state="disabled")
 
     def create_pfx():
-        pfx_text = pfx_path_var.get().strip()
-        if not pfx_text:
-            messagebox.showerror("Missing PFX path", "Choose a PFX output path first.")
-            return
-        password = pfx_password_var.get()
-        subject = pfx_subject_var.get().strip()
-        if not subject:
-            app_name = app_name_var.get().strip()
-            subject = f"CN={app_name}" if app_name else ""
-        output_path = Path(pfx_text).expanduser().resolve()
-        ok, output = _create_self_signed_pfx(subject, password, output_path)
-        if output:
-            append_signing_log(output)
-            print(output)
-        if ok:
-            messagebox.showinfo("PFX created", f"PFX created:\n{output_path}")
-        else:
-            messagebox.showerror("PFX creation failed", output or "Failed to create PFX.")
+        pfx_window = tk.Toplevel(root)
+        pfx_window.title("Create PFX (OpenSSL)")
+        pfx_window.geometry("620x360")
+        pfx_window.resizable(True, False)
+
+        frame = ttk.Frame(pfx_window, padding=16, style="Content.TFrame")
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        key_var = tk.StringVar(value="")
+        cert_var = tk.StringVar(value="")
+        days_var = tk.StringVar(value="365")
+        subject_var = tk.StringVar(value=pfx_subject_var.get().strip() or "CN=Unknown")
+        pfx_out_var = tk.StringVar(value="")
+        password_var = tk.StringVar(value=pfx_password_var.get())
+
+        def browse_path(var, ext_label):
+            path = filedialog.asksaveasfilename(
+                defaultextension=ext_label,
+                filetypes=[(f"{ext_label.upper()} file", f"*{ext_label}"), ("All files", "*.*")]
+            )
+            if path:
+                var.set(path)
+
+        add_row(frame, 0, "Key output", ttk.Entry(frame, textvariable=key_var), ttk.Button(frame, text="Browse", style="Ghost.TButton", command=lambda: browse_path(key_var, ".pem")))
+        add_row(frame, 1, "Cert output", ttk.Entry(frame, textvariable=cert_var), ttk.Button(frame, text="Browse", style="Ghost.TButton", command=lambda: browse_path(cert_var, ".pem")))
+        add_row(frame, 2, "Days", ttk.Entry(frame, textvariable=days_var))
+        add_row(frame, 3, "Subject", ttk.Entry(frame, textvariable=subject_var))
+        add_row(frame, 4, "PFX output", ttk.Entry(frame, textvariable=pfx_out_var), ttk.Button(frame, text="Browse", style="Ghost.TButton", command=lambda: browse_path(pfx_out_var, ".pfx")))
+        add_row(frame, 5, "PFX password", ttk.Entry(frame, textvariable=password_var, show="*"))
+
+        command_preview = tk.StringVar(value="openssl req -x509 -newkey rsa:2048 -nodes -keyout ...")
+        ttk.Label(frame, textvariable=command_preview, style="Muted.TLabel").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 6))
+
+        def update_preview(*_):
+            command_preview.set(
+                "openssl req -x509 -newkey rsa:2048 -nodes "
+                f"-keyout {key_var.get().strip() or 'key.pem'} "
+                f"-out {cert_var.get().strip() or 'cert.pem'} "
+                f"-days {days_var.get().strip() or '365'} "
+                f"-subj \"/{subject_var.get().strip() or 'CN=Unknown'}\" "
+                "&& openssl pkcs12 -export "
+                f"-out {pfx_out_var.get().strip() or 'cert.pfx'} "
+                f"-inkey {key_var.get().strip() or 'key.pem'} "
+                f"-in {cert_var.get().strip() or 'cert.pem'} "
+                f"-passout pass:{password_var.get().strip() or 'password'}"
+            )
+
+        for var in (key_var, cert_var, days_var, subject_var, pfx_out_var, password_var):
+            var.trace_add("write", update_preview)
+        update_preview()
+
+        actions = ttk.Frame(frame, style="Content.TFrame")
+        actions.grid(row=7, column=0, columnspan=3, sticky="e", pady=(8, 0))
+
+        def run_create():
+            if not key_var.get().strip():
+                messagebox.showerror("Missing key output", "Choose a key output path.")
+                return
+            if not cert_var.get().strip():
+                messagebox.showerror("Missing cert output", "Choose a cert output path.")
+                return
+            if not pfx_out_var.get().strip():
+                messagebox.showerror("Missing PFX output", "Choose a PFX output path.")
+                return
+            try:
+                days = int(days_var.get().strip() or "365")
+            except ValueError:
+                messagebox.showerror("Invalid days", "Days must be a number.")
+                return
+            key_path = Path(key_var.get().strip()).expanduser().resolve()
+            cert_path = Path(cert_var.get().strip()).expanduser().resolve()
+            pfx_path = Path(pfx_out_var.get().strip()).expanduser().resolve()
+            subject = subject_var.get().strip()
+            password = password_var.get()
+            ok, output = _create_pfx_with_openssl(key_path, cert_path, days, subject, pfx_path, password)
+            if output:
+                append_signing_log(output)
+                print(output)
+            if ok:
+                pfx_path_var.set(str(pfx_path))
+                pfx_password_var.set(password)
+                pfx_subject_var.set(subject)
+                messagebox.showinfo("PFX created", f"PFX created:\n{pfx_path}")
+                pfx_window.destroy()
+            else:
+                messagebox.showerror("PFX creation failed", output or "Failed to create PFX.")
+
+        ttk.Button(actions, text="Create", style="Accent.TButton", command=run_create).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Cancel", style="Ghost.TButton", command=pfx_window.destroy).grid(row=0, column=1)
 
     def sign_msix():
         tool_path = osslsigncode_tool_var.get().strip()
@@ -1881,37 +2283,75 @@ def _run_install_cli(argv) -> None:
     parser = argparse.ArgumentParser(description="Run or deploy a loose Appx build")
     parser.add_argument("build_dir", help="Directory containing AppxManifest.xml")
     parser.add_argument("--no-launch", action="store_true", help="Do not launch after registering")
-    parser.add_argument("--remote", action="store_true", help="Deploy to a remote device portal via network share")
-    parser.add_argument("--ip", default="", help="Device portal IP or host (optional if saved in config)")
-    parser.add_argument("--username", default="", help="Device portal username")
-    parser.add_argument("--password", default="", help="Device portal password")
-    parser.add_argument("--network-share", default="", help="UNC path to the loose app share (\\\\host\\share\\path)")
+    parser.add_argument("--remote", action="store_true", help="Deploy to a remote device portal")
+    parser.add_argument("--json", default="", help="Path to mingw_winrt.json with device portal credentials")
     args = parser.parse_args(argv)
 
     build_dir = Path(args.build_dir).expanduser().resolve()
+    if build_dir.is_file():
+        if build_dir.suffix.lower() not in ('.msix', '.msixbundle', '.appx', '.appxbundle'):
+            _error("Unsupported package type. Use .msix, .msixbundle, .appx, or .appxbundle.")
+            sys.exit(1)
+        if args.remote:
+            if not args.json:
+                _error("--json is required for remote deploy.")
+                sys.exit(1)
+            json_path = Path(args.json).expanduser().resolve()
+            if not json_path.exists():
+                _error(f"Config not found: {json_path}")
+                sys.exit(1)
+            portal = _load_device_portal_from_json(json_path)
+            ip = portal.get("ip", "")
+            username = portal.get("username", "")
+            password = portal.get("password", "")
+            if not ip or not username or not password:
+                _error("JSON must include ip, username, and password.")
+                sys.exit(1)
+            _info("Deploying MSIX package to device portal...")
+            ok, output = _deploy_msix_remote(build_dir, ip, username, password)
+            if output:
+                print(output)
+            if ok:
+                _success("Remote install accepted.")
+                return
+            _error("Remote MSIX deploy failed.")
+            sys.exit(1)
+
+        _info("Installing MSIX locally...")
+        ok, output = _install_msix_local(build_dir)
+        if output:
+            print(output)
+        if ok:
+            _success("Install completed.")
+            return
+        _error("MSIX install failed.")
+        sys.exit(1)
     manifest_path = _find_appx_manifest(build_dir)
     if not manifest_path:
         _error(f"AppxManifest.xml not found in {build_dir}")
         sys.exit(1)
 
-    config_path = _resolve_project_config_for_dir(build_dir)
-    saved = _read_device_portal_settings(config_path)
-    ip = args.ip or saved.get("ip", "")
-    username = args.username or saved.get("username", "")
-    password = args.password or saved.get("password", "")
-    network_share = args.network_share or saved.get("networkShare", "")
-
-    if config_path and (ip or username or password or network_share):
-        _save_device_portal_settings(config_path, {
-            "ip": ip,
-            "username": username,
-            "password": password,
-            "networkShare": network_share,
-        })
-
     if args.remote:
+        if not args.json:
+            _error("--json is required for remote deploy.")
+            sys.exit(1)
+        json_path = Path(args.json).expanduser().resolve()
+        if not json_path.exists():
+            _error(f"Config not found: {json_path}")
+            sys.exit(1)
+        portal = _load_device_portal_from_json(json_path)
+        ip = portal.get("ip", "")
+        username = portal.get("username", "")
+        password = portal.get("password", "")
+        if not ip or not username or not password:
+            _error("JSON must include ip, username, and password.")
+            sys.exit(1)
+        share_path = str(build_dir)
+        if not (share_path.startswith("\\\\") or share_path.startswith("//")):
+            _error("Remote deploy requires a UNC path (\\\\host\\share\\path).")
+            sys.exit(1)
         _info("Deploying loose folder to device portal...")
-        ok, output = _deploy_loose_remote(network_share, ip, username, password)
+        ok, output = _deploy_loose_remote(share_path, ip, username, password)
         if output:
             print(output)
         if ok:
