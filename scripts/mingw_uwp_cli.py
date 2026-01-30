@@ -9,6 +9,7 @@ import base64
 import ssl
 import urllib.request
 import urllib.error
+import webbrowser
 from pathlib import Path
 import re
 import json
@@ -33,6 +34,7 @@ WINDOWS = os.name == 'nt'
 RUN_ALIASES = {'run', 'install', 'runner', 'installer', 'deploy'}
 DEVICE_PORTAL_KEY = 'devicePortal'
 REPO_ROOT = Path(__file__).parent.parent
+TOOL_DB_PATH = Path(__file__).with_name("db.json")
 NAMESPACE_URIS = {
     'foundation': 'http://schemas.microsoft.com/appx/manifest/foundation/windows10',
     'uap': 'http://schemas.microsoft.com/appx/manifest/uap/windows10',
@@ -482,6 +484,147 @@ def _save_device_portal_settings(config_path: Optional[Path], settings: dict) ->
     data[DEVICE_PORTAL_KEY] = settings
     _save_config(config_path, data)
 
+def _load_tool_db() -> dict:
+    if not TOOL_DB_PATH.exists():
+        return {}
+    try:
+        data = json.loads(TOOL_DB_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _save_tool_db(data: dict) -> None:
+    try:
+        TOOL_DB_PATH.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+def _remember_tool_path(key: str, value: str) -> None:
+    value = value.strip()
+    if not value:
+        return
+    data = _load_tool_db()
+    data[key] = value
+    _save_tool_db(data)
+
+def _suggest_msix_output(build_dir: Path) -> Path:
+    manifest_path = _find_appx_manifest(build_dir)
+    base_name = ''
+    if manifest_path:
+        identity_name, _ = _read_manifest_identity(manifest_path)
+        base_name = identity_name or ''
+    if not base_name:
+        base_name = build_dir.name or 'app'
+    safe_name = re.sub(r'[^0-9A-Za-z_.-]', '_', base_name)
+    return build_dir / f"{safe_name}.msix"
+
+def _run_makemsix(tool_path: str, build_dir: Path, output_path: Path) -> tuple[bool, str]:
+    manifest_path = _find_appx_manifest(build_dir)
+    if not manifest_path:
+        return False, f"AppxManifest.xml not found in {build_dir}"
+    if not output_path:
+        return False, "Output MSIX path is required."
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    exe = tool_path.strip() or "makemsix"
+    command = [exe, "pack", "-d", str(build_dir), "-p", str(output_path)]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True)
+    except FileNotFoundError:
+        return False, f"makemsix not found: {exe}"
+    except Exception as exc:
+        return False, f"makemsix failed: {exc}"
+    output = (completed.stdout or "") + (completed.stderr or "")
+    normalized = output.strip()
+    if completed.returncode == 0:
+        return True, normalized
+    if "Unrecognized command: pack" in output or ("Commands:" in output and "pack" not in output):
+        hint = (
+            "This makemsix build does not support the 'pack' command. "
+            "Install a pack-capable build compile with --pack!."
+        )
+        return False, (normalized + "\n" + hint).strip()
+    return False, normalized or f"makemsix failed with exit code {completed.returncode}."
+
+def _run_osslsigncode(tool_path: str, cert_path: Path, password: str, name: str, input_msix: Path, output_msix: Path) -> tuple[bool, str]:
+    if not cert_path.exists():
+        return False, f"PFX not found: {cert_path}"
+    if not input_msix.exists():
+        return False, f"Input MSIX not found: {input_msix}"
+    exe = tool_path.strip() or "osslsigncode"
+    command = [
+        exe, "sign",
+        "-pkcs12", str(cert_path),
+        "-pass", password,
+        "-n", name,
+        "-in", str(input_msix),
+        "-out", str(output_msix),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True)
+    except FileNotFoundError:
+        return False, f"osslsigncode not found: {exe}"
+    except Exception as exc:
+        return False, f"osslsigncode failed: {exc}"
+    output = (completed.stdout or "") + (completed.stderr or "")
+    if completed.returncode == 0:
+        return True, output.strip()
+    return False, output.strip() or f"osslsigncode failed with exit code {completed.returncode}."
+
+def _create_self_signed_pfx(subject: str, password: str, output_path: Path) -> tuple[bool, str]:
+    if not subject:
+        return False, "Certificate subject is required (example: CN=MyApp)."
+    if not password:
+        return False, "PFX password is required."
+    if not output_path:
+        return False, "PFX output path is required."
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if WINDOWS:
+        subject_safe = subject.replace("'", "''")
+        password_safe = password.replace("'", "''")
+        output_safe = str(output_path).replace("'", "''")
+        script = (
+            "$pwd = ConvertTo-SecureString '{password}' -AsPlainText -Force;"
+            "$cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject '{subject}' "
+            "-CertStoreLocation 'Cert:\\CurrentUser\\My';"
+            "Export-PfxCertificate -Cert $cert -FilePath '{output}' -Password $pwd | Out-Null;"
+            "Remove-Item 'Cert:\\CurrentUser\\My\\$($cert.Thumbprint)' -ErrorAction SilentlyContinue | Out-Null;"
+            "Write-Output 'PFX created.'"
+        ).format(password=password_safe, subject=subject_safe, output=output_safe)
+        code, output = _run_powershell(script)
+        if code == 0:
+            return True, output.strip()
+        return False, output.strip() or "Failed to create PFX."
+    openssl_path = shutil.which("openssl")
+    if not openssl_path:
+        return False, "OpenSSL not found. Install OpenSSL or run on Windows to create a PFX."
+    temp_dir = Path(tempfile.mkdtemp())
+    key_path = temp_dir / "key.pem"
+    cert_path = temp_dir / "cert.pem"
+    try:
+        req_cmd = [
+            openssl_path, "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(key_path), "-out", str(cert_path),
+            "-days", "365", "-nodes", "-subj", f"/{subject}"
+        ]
+        req_completed = subprocess.run(req_cmd, capture_output=True, text=True)
+        if req_completed.returncode != 0:
+            output = (req_completed.stdout or "") + (req_completed.stderr or "")
+            return False, output.strip() or "OpenSSL certificate creation failed."
+        pfx_cmd = [
+            openssl_path, "pkcs12", "-export",
+            "-out", str(output_path),
+            "-inkey", str(key_path),
+            "-in", str(cert_path),
+            "-passout", f"pass:{password}",
+        ]
+        pfx_completed = subprocess.run(pfx_cmd, capture_output=True, text=True)
+        output = (pfx_completed.stdout or "") + (pfx_completed.stderr or "")
+        if pfx_completed.returncode == 0:
+            return True, output.strip() or "PFX created."
+        return False, output.strip() or "OpenSSL PFX export failed."
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 def _find_appx_manifest(build_dir: Path) -> Optional[Path]:
     for name in ('AppxManifest.xml', 'AppxManifest.appxmanifest'):
         candidate = build_dir / name
@@ -908,6 +1051,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     root.resizable(True, True)
 
     colors = _apply_vs_style(root)
+    tool_db = _load_tool_db()
 
     main = ttk.Frame(root, style="App.TFrame")
     main.pack(fill=tk.BOTH, expand=True)
@@ -1257,9 +1401,269 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
 
     pages["runner"] = runner_page
 
+    # Packaging Page
+    packaging_page = ttk.Frame(content, style="Content.TFrame")
+    packaging_page.columnconfigure(0, weight=1)
+    packaging_page.rowconfigure(2, weight=1)
+
+    packaging_header_row = ttk.Frame(packaging_page, style="Content.TFrame")
+    packaging_header_row.grid(row=0, column=0, sticky="ew")
+    packaging_header_row.columnconfigure(0, weight=1)
+    packaging_header_row.columnconfigure(1, weight=0)
+    packaging_header = ttk.Label(packaging_header_row, text="Package MSIX", style="Header.TLabel")
+    packaging_header.grid(row=0, column=0, sticky="w")
+    packaging_hint = ttk.Label(packaging_header_row, text="Use makemsix to package a build folder.", style="Muted.TLabel")
+    packaging_hint.grid(row=0, column=1, sticky="e")
+
+    packaging_card = create_card(packaging_page, "makemsix")
+    packaging_card.grid(row=1, column=0, sticky="ew", pady=(12, 8))
+
+    packaging_log_card = create_card(packaging_page, "Output")
+    packaging_log_card.grid(row=2, column=0, sticky="nsew")
+    packaging_log_card.columnconfigure(0, weight=1)
+    packaging_log_card.rowconfigure(0, weight=1)
+
+    makemsix_tool_var = tk.StringVar(value=tool_db.get("makemsix", ""))
+    packaging_build_var = tk.StringVar(value=str(Path.cwd()))
+    packaging_output_var = tk.StringVar(value="")
+    packaging_status = tk.StringVar(value="Select a build folder that contains AppxManifest.xml.")
+
+    def update_packaging_state(path: Optional[Path]):
+        if not path:
+            packaging_status.set("Select a build folder that contains AppxManifest.xml.")
+            return
+        manifest_path = _find_appx_manifest(path)
+        if not manifest_path:
+            packaging_status.set("No AppxManifest.xml found in this folder.")
+            return
+        packaging_status.set(f"Manifest OK: {manifest_path.name}")
+        if not packaging_output_var.get().strip():
+            packaging_output_var.set(str(_suggest_msix_output(path)))
+
+    def browse_makemsix():
+        path = filedialog.askopenfilename()
+        if path:
+            makemsix_tool_var.set(path)
+            _remember_tool_path("makemsix", path)
+
+    def browse_packaging_build():
+        path = filedialog.askdirectory()
+        if path:
+            packaging_build_var.set(path)
+            update_packaging_state(Path(path))
+
+    def browse_packaging_output():
+        initial_dir = packaging_build_var.get().strip() or str(Path.cwd())
+        initial_file = Path(packaging_output_var.get()).name if packaging_output_var.get().strip() else ""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".msix",
+            initialdir=initial_dir,
+            initialfile=initial_file,
+            filetypes=[("MSIX packages", "*.msix"), ("All files", "*.*")]
+        )
+        if path:
+            packaging_output_var.set(path)
+
+    def append_packaging_log(message: str):
+        packaging_log_text.configure(state="normal")
+        packaging_log_text.insert(tk.END, message.rstrip() + "\n")
+        packaging_log_text.see(tk.END)
+        packaging_log_text.configure(state="disabled")
+
+    def run_packaging():
+        build_dir_text = packaging_build_var.get().strip()
+        output_text = packaging_output_var.get().strip()
+        if not build_dir_text:
+            messagebox.showerror("Missing build folder", "Select a build folder first.")
+            return
+        if not output_text:
+            messagebox.showerror("Missing output", "Select an output .msix file.")
+            return
+        build_dir = Path(build_dir_text).expanduser().resolve()
+        output_path = Path(output_text).expanduser().resolve()
+        tool_path = makemsix_tool_var.get().strip()
+        if tool_path:
+            _remember_tool_path("makemsix", tool_path)
+        ok, output = _run_makemsix(tool_path, build_dir, output_path)
+        if output:
+            append_packaging_log(output)
+            print(output)
+        if ok:
+            messagebox.showinfo("MSIX created", f"MSIX created:\n{output_path}")
+        else:
+            messagebox.showerror("makemsix failed", output or "makemsix failed.")
+
+    add_row(packaging_card, 0, "makemsix path", ttk.Entry(packaging_card, textvariable=makemsix_tool_var), ttk.Button(packaging_card, text="Browse", style="Ghost.TButton", command=browse_makemsix))
+    add_row(packaging_card, 1, "Build folder", ttk.Entry(packaging_card, textvariable=packaging_build_var), ttk.Button(packaging_card, text="Browse", style="Ghost.TButton", command=browse_packaging_build))
+    add_row(packaging_card, 2, "Output MSIX", ttk.Entry(packaging_card, textvariable=packaging_output_var), ttk.Button(packaging_card, text="Browse", style="Ghost.TButton", command=browse_packaging_output))
+    ttk.Label(packaging_card, textvariable=packaging_status, style="Muted.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+    packaging_actions = ttk.Frame(packaging_card, style="Content.TFrame")
+    packaging_actions.grid(row=4, column=0, columnspan=3, sticky="e", pady=(6, 0))
+    ttk.Button(packaging_actions, text="Package MSIX", style="Accent.TButton", command=run_packaging).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(packaging_actions, text="Get makemsix", style="Ghost.TButton", command=lambda: webbrowser.open("https://github.com/microsoft/msix-packaging")).grid(row=0, column=1)
+
+    packaging_log_text = tk.Text(packaging_log_card, height=10, background=colors["panel"], foreground=colors["text"], insertbackground=colors["text"], borderwidth=0)
+    packaging_log_text.configure(state="disabled")
+    packaging_log_scroll = ttk.Scrollbar(packaging_log_card, orient=tk.VERTICAL, command=packaging_log_text.yview)
+    packaging_log_text.configure(yscrollcommand=packaging_log_scroll.set)
+    packaging_log_text.grid(row=0, column=0, sticky="nsew")
+    packaging_log_scroll.grid(row=0, column=1, sticky="ns")
+
+    update_packaging_state(Path(packaging_build_var.get()))
+    pages["packaging"] = packaging_page
+
+    # Signing Page
+    signing_page = ttk.Frame(content, style="Content.TFrame")
+    signing_page.columnconfigure(0, weight=1)
+    signing_page.rowconfigure(2, weight=1)
+
+    signing_header_row = ttk.Frame(signing_page, style="Content.TFrame")
+    signing_header_row.grid(row=0, column=0, sticky="ew")
+    signing_header_row.columnconfigure(0, weight=1)
+    signing_header_row.columnconfigure(1, weight=0)
+    signing_header = ttk.Label(signing_header_row, text="Sign MSIX", style="Header.TLabel")
+    signing_header.grid(row=0, column=0, sticky="w")
+    signing_hint = ttk.Label(signing_header_row, text="Use osslsigncode to sign an MSIX package.", style="Muted.TLabel")
+    signing_hint.grid(row=0, column=1, sticky="e")
+
+    signing_card = create_card(signing_page, "osslsigncode sign")
+    signing_card.grid(row=1, column=0, sticky="ew", pady=(12, 8))
+
+    signing_log_card = create_card(signing_page, "Output")
+    signing_log_card.grid(row=2, column=0, sticky="nsew")
+    signing_log_card.columnconfigure(0, weight=1)
+    signing_log_card.rowconfigure(0, weight=1)
+
+    osslsigncode_tool_var = tk.StringVar(value=tool_db.get("osslsigncode", tool_db.get("osssigntiool", "")))
+    pfx_path_var = tk.StringVar(value="")
+    pfx_password_var = tk.StringVar(value="")
+    app_name_var = tk.StringVar(value="")
+    input_msix_var = tk.StringVar(value="")
+    output_msix_var = tk.StringVar(value="")
+    pfx_subject_var = tk.StringVar(value="CN=MyApp")
+
+    def browse_osslsigncode():
+        path = filedialog.askopenfilename()
+        if path:
+            osslsigncode_tool_var.set(path)
+            _remember_tool_path("osslsigncode", path)
+
+    def browse_pfx():
+        path = filedialog.askopenfilename(filetypes=[("PFX certificate", "*.pfx"), ("All files", "*.*")])
+        if path:
+            pfx_path_var.set(path)
+
+    def browse_input_msix():
+        path = filedialog.askopenfilename(filetypes=[("MSIX packages", "*.msix"), ("All files", "*.*")])
+        if path:
+            input_msix_var.set(path)
+            if not output_msix_var.get().strip():
+                input_path = Path(path)
+                output_msix_var.set(str(input_path.with_name(f"{input_path.stem}-signed.msix")))
+
+    def browse_output_msix():
+        initial_dir = str(Path(input_msix_var.get()).parent) if input_msix_var.get().strip() else str(Path.cwd())
+        initial_file = Path(output_msix_var.get()).name if output_msix_var.get().strip() else ""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".msix",
+            initialdir=initial_dir,
+            initialfile=initial_file,
+            filetypes=[("MSIX packages", "*.msix"), ("All files", "*.*")]
+        )
+        if path:
+            output_msix_var.set(path)
+
+    def append_signing_log(message: str):
+        signing_log_text.configure(state="normal")
+        signing_log_text.insert(tk.END, message.rstrip() + "\n")
+        signing_log_text.see(tk.END)
+        signing_log_text.configure(state="disabled")
+
+    def create_pfx():
+        pfx_text = pfx_path_var.get().strip()
+        if not pfx_text:
+            messagebox.showerror("Missing PFX path", "Choose a PFX output path first.")
+            return
+        password = pfx_password_var.get()
+        subject = pfx_subject_var.get().strip()
+        if not subject:
+            app_name = app_name_var.get().strip()
+            subject = f"CN={app_name}" if app_name else ""
+        output_path = Path(pfx_text).expanduser().resolve()
+        ok, output = _create_self_signed_pfx(subject, password, output_path)
+        if output:
+            append_signing_log(output)
+            print(output)
+        if ok:
+            messagebox.showinfo("PFX created", f"PFX created:\n{output_path}")
+        else:
+            messagebox.showerror("PFX creation failed", output or "Failed to create PFX.")
+
+    def sign_msix():
+        tool_path = osslsigncode_tool_var.get().strip()
+        if tool_path:
+            _remember_tool_path("osslsigncode", tool_path)
+        cert_text = pfx_path_var.get().strip()
+        input_text = input_msix_var.get().strip()
+        output_text = output_msix_var.get().strip()
+        app_name = app_name_var.get().strip()
+        password = pfx_password_var.get()
+        if not cert_text:
+            messagebox.showerror("Missing PFX", "Select a .pfx certificate file.")
+            return
+        if not input_text:
+            messagebox.showerror("Missing input", "Select an input .msix file.")
+            return
+        if not output_text:
+            messagebox.showerror("Missing output", "Select an output .msix file.")
+            return
+        if not app_name:
+            messagebox.showerror("Missing name", "Enter the app name for signing.")
+            return
+        if not password:
+            messagebox.showerror("Missing password", "Enter the PFX password.")
+            return
+        cert_path = Path(cert_text).expanduser().resolve()
+        input_path = Path(input_text).expanduser().resolve()
+        output_path = Path(output_text).expanduser().resolve()
+        ok, output = _run_osslsigncode(tool_path, cert_path, password, app_name, input_path, output_path)
+        if output:
+            append_signing_log(output)
+            print(output)
+        if ok:
+            messagebox.showinfo("MSIX signed", f"Signed MSIX:\n{output_path}")
+        else:
+            messagebox.showerror("Signing failed", output or "osslsigncode failed.")
+
+    add_row(signing_card, 0, "osslsigncode path", ttk.Entry(signing_card, textvariable=osslsigncode_tool_var), ttk.Button(signing_card, text="Browse", style="Ghost.TButton", command=browse_osslsigncode))
+    add_row(signing_card, 1, "PFX file", ttk.Entry(signing_card, textvariable=pfx_path_var), ttk.Button(signing_card, text="Browse", style="Ghost.TButton", command=browse_pfx))
+    add_row(signing_card, 2, "PFX password", ttk.Entry(signing_card, textvariable=pfx_password_var, show="*"))
+    add_row(signing_card, 3, "Certificate subject", ttk.Entry(signing_card, textvariable=pfx_subject_var))
+    add_row(signing_card, 4, "App name", ttk.Entry(signing_card, textvariable=app_name_var))
+    add_row(signing_card, 5, "Input MSIX", ttk.Entry(signing_card, textvariable=input_msix_var), ttk.Button(signing_card, text="Browse", style="Ghost.TButton", command=browse_input_msix))
+    add_row(signing_card, 6, "Output MSIX", ttk.Entry(signing_card, textvariable=output_msix_var), ttk.Button(signing_card, text="Browse", style="Ghost.TButton", command=browse_output_msix))
+
+    signing_actions = ttk.Frame(signing_card, style="Content.TFrame")
+    signing_actions.grid(row=7, column=0, columnspan=3, sticky="e", pady=(6, 0))
+    ttk.Button(signing_actions, text="Create PFX", style="Ghost.TButton", command=create_pfx).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(signing_actions, text="Sign MSIX", style="Accent.TButton", command=sign_msix).grid(row=0, column=1, padx=(0, 8))
+    ttk.Button(signing_actions, text="Get osslsigncode", style="Ghost.TButton", command=lambda: webbrowser.open("https://github.com/mtrojnar/osslsigncode")).grid(row=0, column=2)
+
+    signing_log_text = tk.Text(signing_log_card, height=10, background=colors["panel"], foreground=colors["text"], insertbackground=colors["text"], borderwidth=0)
+    signing_log_text.configure(state="disabled")
+    signing_log_scroll = ttk.Scrollbar(signing_log_card, orient=tk.VERTICAL, command=signing_log_text.yview)
+    signing_log_text.configure(yscrollcommand=signing_log_scroll.set)
+    signing_log_text.grid(row=0, column=0, sticky="nsew")
+    signing_log_scroll.grid(row=0, column=1, sticky="ns")
+
+    pages["signing"] = signing_page
+
     add_nav_button("create", "New Project")
     add_nav_button("editor", "Editor")
     add_nav_button("runner", "Runner / Installer")
+    add_nav_button("packaging", "Packaging")
+    add_nav_button("signing", "Signing")
 
     show_page("create")
 
@@ -1445,6 +1849,34 @@ def edit_project_config_gui(config_path: Path, parent=None) -> None:
     if owning_root:
         root.mainloop()
 
+def _run_makemsix_cli(argv) -> None:
+    parser = argparse.ArgumentParser(description="Package MSIX using makemsix")
+    parser.add_argument("build_dir", help="Directory containing AppxManifest.xml")
+    parser.add_argument("-o", "--output", default="", help="Output .msix path (optional)")
+    parser.add_argument("--makemsix", default="", help="Path to makemsix executable (optional)")
+    args = parser.parse_args(argv)
+
+    build_dir = Path(args.build_dir).expanduser().resolve()
+    manifest_path = _find_appx_manifest(build_dir)
+    if not manifest_path:
+        _error(f"AppxManifest.xml not found in {build_dir}")
+        sys.exit(1)
+
+    output_path = Path(args.output).expanduser().resolve() if args.output else _suggest_msix_output(build_dir)
+    tool_db = _load_tool_db()
+    tool_path = args.makemsix or tool_db.get("makemsix", "")
+    if args.makemsix:
+        _remember_tool_path("makemsix", args.makemsix)
+
+    ok, output = _run_makemsix(tool_path, build_dir, output_path)
+    if output:
+        print(output)
+    if ok:
+        _success(f"MSIX created: {output_path}")
+        return
+    _error("makemsix failed.")
+    sys.exit(1)
+
 def _run_install_cli(argv) -> None:
     parser = argparse.ArgumentParser(description="Run or deploy a loose Appx build")
     parser.add_argument("build_dir", help="Directory containing AppxManifest.xml")
@@ -1545,6 +1977,12 @@ def main():
 
     if len(sys.argv) >= 2:
         first = sys.argv[1].lower()
+        if first == "makemsix":
+            if len(sys.argv) < 3:
+                _error("Missing build directory for makemsix.")
+                sys.exit(1)
+            _run_makemsix_cli(sys.argv[2:])
+            return
         if first in RUN_ALIASES:
             if len(sys.argv) < 3:
                 _error("Missing build directory for run/install.")
