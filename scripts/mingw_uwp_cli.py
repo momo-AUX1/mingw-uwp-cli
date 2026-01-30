@@ -33,6 +33,8 @@ MSVC_DLLS = (
     'msvcp140_app.dll',
     'vcruntime140_app.dll',
     'vcruntime140_1_app.dll',
+    'dxil.dll',
+    'vccorlib140_app.dll'
 )
 WINDOWS = os.name == 'nt'
 RUN_ALIASES = {'run', 'install', 'runner', 'installer', 'deploy'}
