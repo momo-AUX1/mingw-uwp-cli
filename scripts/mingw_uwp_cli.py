@@ -4,6 +4,11 @@ import shutil
 import uuid
 import tempfile
 import os
+import subprocess
+import base64
+import ssl
+import urllib.request
+import urllib.error
 from pathlib import Path
 import re
 import json
@@ -24,6 +29,9 @@ MSVC_DLLS = (
     'vcruntime140_app.dll',
     'vcruntime140_1_app.dll',
 )
+WINDOWS = os.name == 'nt'
+RUN_ALIASES = {'run', 'install', 'runner', 'installer', 'deploy'}
+DEVICE_PORTAL_KEY = 'devicePortal'
 REPO_ROOT = Path(__file__).parent.parent
 NAMESPACE_URIS = {
     'foundation': 'http://schemas.microsoft.com/appx/manifest/foundation/windows10',
@@ -337,6 +345,12 @@ def _write_project_config(out_dir: Path, project_type: str, project_name: str, a
             'icon': '',
             'banner': ''
         },
+        DEVICE_PORTAL_KEY: {
+            'ip': '',
+            'username': '',
+            'password': '',
+            'networkShare': ''
+        },
         'capabilities': [],
         'includeMsvcDlls': include_msvc_dlls,
         'version': 1
@@ -426,6 +440,172 @@ def _load_config(path: Path) -> dict:
 
 def _save_config(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2), encoding='utf-8')
+
+def _load_config_safe(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+
+def _resolve_project_config_for_dir(project_dir: Path) -> Optional[Path]:
+    for candidate in (project_dir, project_dir.parent):
+        config_path = candidate / DEFAULT_CONFIG_NAME
+        if config_path.exists():
+            return config_path
+    return None
+
+def _read_device_portal_settings(config_path: Optional[Path]) -> dict:
+    if not config_path or not config_path.exists():
+        return {}
+    data = _load_config_safe(config_path)
+    if not isinstance(data, dict):
+        return {}
+    portal = data.get(DEVICE_PORTAL_KEY, {})
+    if isinstance(portal, dict):
+        return portal
+    return {}
+
+def _save_device_portal_settings(config_path: Optional[Path], settings: dict) -> None:
+    if not config_path:
+        return
+    data = _load_config_safe(config_path) or {}
+    data[DEVICE_PORTAL_KEY] = settings
+    _save_config(config_path, data)
+
+def _find_appx_manifest(build_dir: Path) -> Optional[Path]:
+    for name in ('AppxManifest.xml', 'AppxManifest.appxmanifest'):
+        candidate = build_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+def _read_manifest_identity(manifest_path: Path) -> tuple[str, str]:
+    try:
+        tree = ET.parse(str(manifest_path))
+        root = tree.getroot()
+        identity = root.find('./{*}Identity')
+        identity_name = identity.get('Name') if identity is not None else ''
+        app_id = ''
+        applications = root.find('./{*}Applications')
+        if applications is not None:
+            app_el = applications.find('./{*}Application')
+            if app_el is not None:
+                app_id = app_el.get('Id') or ''
+        return identity_name or '', app_id or ''
+    except Exception:
+        return '', ''
+
+def _run_powershell(command: str, cwd: Optional[Path] = None) -> tuple[int, str]:
+    if not WINDOWS:
+        return 1, "PowerShell is only available on Windows."
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+    )
+    output = ""
+    if completed.stdout:
+        output += completed.stdout
+    if completed.stderr:
+        output += completed.stderr
+    return completed.returncode, output
+
+def _extract_activity_id(text: str) -> Optional[str]:
+    match = re.search(r'ActivityId:\s*([0-9a-fA-F-]+)', text)
+    if match:
+        return match.group(1)
+    return None
+
+def _collect_deployment_log(activity_id: str) -> str:
+    command = f"Get-AppxLog -ActivityID {activity_id} | Out-String"
+    _, output = _run_powershell(command)
+    return output.strip()
+
+def _collect_runtime_logs(identity_name: str, minutes: int = 10) -> str:
+    if not identity_name:
+        return "Package identity not found; cannot filter runtime logs."
+    script = (
+        "$pkg = Get-AppxPackage -Name \"{name}\" | Select-Object -First 1;"
+        "if (-not $pkg) {{ Write-Output \"Package not found for identity.\"; exit 0 }};"
+        "$family = [regex]::Escape($pkg.PackageFamilyName);"
+        "$events = Get-WinEvent -FilterHashtable @{{LogName='Microsoft-Windows-AppModel-Runtime/Admin'; StartTime=(Get-Date).AddMinutes(-{minutes})}} "
+        "| Where-Object {{ $_.Message -match $family }} | Select-Object -First 30;"
+        "if (-not $events) {{ Write-Output \"No recent AppModel-Runtime errors found.\"; exit 0 }};"
+        "$events | Format-List TimeCreated, Id, LevelDisplayName, Message"
+    ).format(name=identity_name.replace('"', '\\"'), minutes=minutes)
+    _, output = _run_powershell(script)
+    return output.strip()
+
+def _register_appx(manifest_path: Path) -> tuple[bool, str]:
+    command = f"Add-AppxPackage -Register \"{manifest_path}\" -Verbose -ErrorAction Stop"
+    code, output = _run_powershell(command, cwd=manifest_path.parent)
+    if code == 0:
+        return True, output.strip()
+    activity_id = _extract_activity_id(output)
+    if activity_id:
+        log_output = _collect_deployment_log(activity_id)
+        if log_output:
+            output = output + "\n\n=== Deployment Log ===\n" + log_output
+    return False, output.strip()
+
+def _launch_app(identity_name: str, app_id: str) -> tuple[bool, str]:
+    if not identity_name or not app_id:
+        return False, "Missing package identity or application id in manifest."
+    script = (
+        "$pkg = Get-AppxPackage -Name \"{name}\" | Select-Object -First 1;"
+        "if (-not $pkg) {{ Write-Output \"Package not found after registration.\"; exit 1 }};"
+        "$appid = \"{appid}\";"
+        "Start-Process \"shell:AppsFolder\\$($pkg.PackageFamilyName)!$appid\""
+    ).format(name=identity_name.replace('"', '\\"'), appid=app_id.replace('"', '\\"'))
+    code, output = _run_powershell(script)
+    if code == 0:
+        return True, output.strip()
+    return False, output.strip()
+
+def _normalize_wdp_host(host: str) -> str:
+    host = host.strip()
+    if not host:
+        return ''
+    if host.startswith('http://') or host.startswith('https://'):
+        return host.rstrip('/')
+    if ':' in host:
+        return f"https://{host}"
+    return f"https://{host}:11443"
+
+def _deploy_loose_remote(network_share: str, host: str, username: str, password: str) -> tuple[bool, str]:
+    if not network_share:
+        return False, "Network share is required for loose deployment."
+    base_url = _normalize_wdp_host(host)
+    if not base_url:
+        return False, "Device IP/host is required."
+    url = f"{base_url}/api/app/packagemanager/networkapp"
+    payload = {
+        "mainpackage": {
+            "networkshare": network_share,
+            "username": username or "",
+            "password": password or "",
+        }
+    }
+    data = json.dumps(payload).encode('utf-8')
+    request_obj = urllib.request.Request(url, data=data, method='POST')
+    request_obj.add_header('Content-Type', 'application/json')
+    if username or password:
+        token = base64.b64encode(f"{username}:{password}".encode('utf-8')).decode('ascii')
+        request_obj.add_header('Authorization', f'Basic {token}')
+    context = ssl._create_unverified_context()
+    try:
+        with urllib.request.urlopen(request_obj, context=context, timeout=30) as response:
+            status = response.getcode()
+            body = response.read().decode('utf-8', errors='ignore')
+            if status == 200:
+                return True, body.strip() or "Deploy request accepted."
+            return False, body.strip() or f"Deploy failed with status {status}."
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode('utf-8', errors='ignore') if exc.fp else str(exc)
+        return False, f"Deploy failed: {detail or exc}"
+    except Exception as exc:
+        return False, f"Deploy failed: {exc}"
 
 def _prompt(text: str, current: str) -> str:
     value = input(f"{text} [{current}]: ").strip()
@@ -650,6 +830,59 @@ def edit_project_config(config_path: Path) -> None:
         _copy_msvc_dlls(project_dir, arch)
     _success(f"✅ Updated config: {config_path}")
 
+def _apply_vs_style(root):
+    from tkinter import ttk
+
+    colors = {
+        "bg": "#1e1e1e",
+        "panel": "#252526",
+        "panel_light": "#2d2d30",
+        "panel_dark": "#1b1b1c",
+        "border": "#3f3f46",
+        "text": "#d4d4d4",
+        "muted": "#9e9e9e",
+        "accent": "#0e639c",
+        "accent_hover": "#1177bb",
+    }
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    style.configure("App.TFrame", background=colors["bg"])
+    style.configure("TFrame", background=colors["bg"])
+    style.configure("Header.TFrame", background=colors["panel"])
+    style.configure("Nav.TFrame", background=colors["panel_dark"])
+    style.configure("Content.TFrame", background=colors["bg"])
+    style.configure("Card.TLabelframe", background=colors["panel"], bordercolor=colors["border"])
+    style.configure("Card.TLabelframe.Label", background=colors["panel"], foreground=colors["text"], font=("Segoe UI", 10, "bold"))
+    style.configure("TLabelframe", background=colors["panel"], bordercolor=colors["border"])
+    style.configure("TLabelframe.Label", background=colors["panel"], foreground=colors["text"])
+
+    style.configure("TLabel", background=colors["bg"], foreground=colors["text"])
+    style.configure("Muted.TLabel", background=colors["bg"], foreground=colors["muted"])
+    style.configure("Header.TLabel", background=colors["panel"], foreground=colors["text"], font=("Segoe UI", 12, "bold"))
+
+    style.configure("Nav.TButton", background=colors["panel_dark"], foreground=colors["text"], padding=(14, 10), borderwidth=0)
+    style.map("Nav.TButton", background=[("active", colors["panel_light"])])
+    style.configure("NavActive.TButton", background=colors["accent"], foreground="white", padding=(14, 10), borderwidth=0)
+    style.map("NavActive.TButton", background=[("active", colors["accent_hover"])])
+
+    style.configure("Accent.TButton", background=colors["accent"], foreground="white", padding=(12, 8))
+    style.map("Accent.TButton", background=[("active", colors["accent_hover"])])
+    style.configure("Ghost.TButton", background=colors["panel_light"], foreground=colors["text"], padding=(10, 8))
+    style.map("Ghost.TButton", background=[("active", colors["panel"])])
+
+    style.configure("TEntry", fieldbackground=colors["panel_light"], foreground=colors["text"])
+    style.configure("TCombobox", fieldbackground=colors["panel_light"], foreground=colors["text"])
+    style.map("TCombobox", fieldbackground=[("readonly", colors["panel_light"])])
+    style.configure("TCheckbutton", background=colors["bg"], foreground=colors["text"])
+
+    root.configure(bg=colors["bg"])
+    return colors
+
 def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arch: str, default_publisher: str, images_dir: Path):
     try:
         import tkinter as tk
@@ -659,67 +892,127 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         sys.exit(1)
 
     root = tk.Tk()
-    root.title("MinGW UWP Project Generator")
-    root.geometry("640x450")
-    root.resizable(False, False)
+    root.title("MinGW UWP Studio")
+    root.geometry("980x640")
+    root.minsize(900, 560)
+    root.resizable(True, True)
 
-    header = ttk.Label(root, text="Create a new MinGW UWP project", font=("Segoe UI", 14, "bold"))
-    header.pack(pady=(16, 6))
-    subtitle = ttk.Label(root, text="Choose a template and project settings.")
-    subtitle.pack(pady=(0, 10))
+    colors = _apply_vs_style(root)
 
-    frame = ttk.Frame(root, padding=16)
-    frame.pack(fill=tk.BOTH, expand=True)
+    main = ttk.Frame(root, style="App.TFrame")
+    main.pack(fill=tk.BOTH, expand=True)
+    main.columnconfigure(1, weight=1)
+    main.rowconfigure(1, weight=1)
 
-    def add_row(row, label_text, widget, button=None):
-        label = ttk.Label(frame, text=label_text)
-        label.grid(row=row, column=0, sticky="w", pady=6)
-        widget.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=6)
-        if button is not None:
-            button.grid(row=row, column=2, sticky="e", padx=(8, 0), pady=6)
+    header = ttk.Frame(main, style="Header.TFrame", padding=(16, 10))
+    header.grid(row=0, column=0, columnspan=2, sticky="ew")
+    header.columnconfigure(1, weight=1)
 
-    frame.columnconfigure(1, weight=1)
+    title = ttk.Label(header, text="MinGW UWP Studio", style="Header.TLabel")
+    title.grid(row=0, column=0, sticky="w")
+    header.columnconfigure(1, weight=0)
+
+    nav = ttk.Frame(main, style="Nav.TFrame", padding=(8, 12))
+    nav.grid(row=1, column=0, sticky="ns")
+    nav.columnconfigure(0, weight=1)
+
+    content = ttk.Frame(main, style="Content.TFrame", padding=(16, 16))
+    content.grid(row=1, column=1, sticky="nsew")
+    content.columnconfigure(0, weight=1)
+    content.rowconfigure(0, weight=1)
+
+    pages = {}
+    nav_buttons = {}
+
+    def show_page(name: str):
+        for page in pages.values():
+            page.grid_remove()
+        pages[name].grid(row=0, column=0, sticky="nsew")
+        for key, button in nav_buttons.items():
+            button.configure(style="NavActive.TButton" if key == name else "Nav.TButton")
+
+    def add_nav_button(name: str, text: str):
+        button = ttk.Button(nav, text=text, style="Nav.TButton", command=lambda: show_page(name))
+        button.grid(sticky="ew", pady=4)
+        nav_buttons[name] = button
+
+    def create_card(parent, title_text):
+        frame = ttk.Labelframe(parent, text=title_text, style="Card.TLabelframe", padding=12)
+        frame.columnconfigure(1, weight=1)
+        return frame
+
+    # Create Project Page
+    create_page = ttk.Frame(content, style="Content.TFrame")
+    create_page.columnconfigure(0, weight=1)
+    create_page.rowconfigure(1, weight=1)
+
+    create_header_row = ttk.Frame(create_page, style="Content.TFrame")
+    create_header_row.grid(row=0, column=0, sticky="ew")
+    create_header_row.columnconfigure(0, weight=1)
+    create_header_row.columnconfigure(1, weight=0)
+    create_header = ttk.Label(create_header_row, text="Create a new MinGW UWP project", style="Header.TLabel")
+    create_header.grid(row=0, column=0, sticky="w")
+    create_subtitle = ttk.Label(create_header_row, text="Configure templates, paths, and build settings.", style="Muted.TLabel")
+    create_subtitle.grid(row=0, column=1, sticky="e")
+
+    form_frame = ttk.Frame(create_page, style="Content.TFrame")
+    form_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+    form_frame.columnconfigure(0, weight=1)
+
+    settings_card = create_card(form_frame, "Project settings")
+    settings_card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+    paths_card = create_card(form_frame, "Paths")
+    paths_card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+    options_card = create_card(form_frame, "Options")
+    options_card.grid(row=2, column=0, sticky="ew")
 
     project_type_var = tk.StringVar(value="xaml")
-    project_type = ttk.Combobox(frame, textvariable=project_type_var, state="readonly")
+    project_type = ttk.Combobox(settings_card, textvariable=project_type_var, state="readonly")
     project_type["values"] = ("library", "console", "xaml", "corewindow")
 
     name_var = tk.StringVar(value="MyApp")
-    name_entry = ttk.Entry(frame, textvariable=name_var)
-
-    output_var = tk.StringVar(value=str(default_output_dir))
-    output_entry = ttk.Entry(frame, textvariable=output_var)
-    output_button = ttk.Button(frame, text="Browse", command=lambda: output_var.set(filedialog.askdirectory() or output_var.get()))
-
-    template_var = tk.StringVar(value=str(default_template_dir))
-    template_entry = ttk.Entry(frame, textvariable=template_var)
-    template_button = ttk.Button(frame, text="Browse", command=lambda: template_var.set(filedialog.askdirectory() or template_var.get()))
+    name_entry = ttk.Entry(settings_card, textvariable=name_var)
 
     arch_var = tk.StringVar(value=default_arch)
-    arch_combo = ttk.Combobox(frame, textvariable=arch_var, state="readonly")
+    arch_combo = ttk.Combobox(settings_card, textvariable=arch_var, state="readonly")
     arch_combo["values"] = ("x64", "x86", "arm64", "arm")
 
     publisher_var = tk.StringVar(value=default_publisher)
-    publisher_entry = ttk.Entry(frame, textvariable=publisher_var)
+    publisher_entry = ttk.Entry(settings_card, textvariable=publisher_var)
+
+    def add_row(parent, row, label_text, widget, button=None):
+        label = ttk.Label(parent, text=label_text)
+        label.grid(row=row, column=0, sticky="w", pady=6)
+        widget.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=6)
+        if button is not None:
+            button.grid(row=row, column=2, sticky="e", padx=(8, 0), pady=6)
+
+    add_row(settings_card, 0, "Project type", project_type)
+    add_row(settings_card, 1, "Project name", name_entry)
+    add_row(settings_card, 2, "Architecture", arch_combo)
+    add_row(settings_card, 3, "Publisher", publisher_entry)
+
+    output_var = tk.StringVar(value=str(default_output_dir))
+    output_entry = ttk.Entry(paths_card, textvariable=output_var)
+    output_button = ttk.Button(paths_card, text="Browse", style="Ghost.TButton", command=lambda: output_var.set(filedialog.askdirectory() or output_var.get()))
+
+    template_var = tk.StringVar(value=str(default_template_dir))
+    template_entry = ttk.Entry(paths_card, textvariable=template_var)
+    template_button = ttk.Button(paths_card, text="Browse", style="Ghost.TButton", command=lambda: template_var.set(filedialog.askdirectory() or template_var.get()))
+
+    add_row(paths_card, 0, "Output directory", output_entry, output_button)
+    add_row(paths_card, 1, "Template directory", template_entry, template_button)
 
     overwrite_var = tk.BooleanVar(value=False)
-    overwrite_check = ttk.Checkbutton(frame, text="Overwrite output directory if it exists", variable=overwrite_var)
-
     include_msvc_var = tk.BooleanVar(value=False)
-    include_msvc_check = ttk.Checkbutton(frame, text="Include MSVC DLLs in deps/bin", variable=include_msvc_var)
+    ttk.Checkbutton(options_card, text="Overwrite output directory if it exists", variable=overwrite_var).grid(row=0, column=0, sticky="w", pady=4)
+    ttk.Checkbutton(options_card, text="Include MSVC DLLs in deps/bin", variable=include_msvc_var).grid(row=1, column=0, sticky="w", pady=4)
 
-    add_row(0, "Project type", project_type)
-    add_row(1, "Project name", name_entry)
-    add_row(2, "Output directory", output_entry, output_button)
-    add_row(3, "Template directory", template_entry, template_button)
-    add_row(4, "Architecture", arch_combo)
-    add_row(5, "Publisher", publisher_entry)
-    overwrite_check.grid(row=6, column=1, sticky="w", pady=(10, 6))
-    include_msvc_check.grid(row=7, column=1, sticky="w", pady=(0, 6))
-
-    button_frame = ttk.Frame(root, padding=(16, 0, 16, 16))
-    button_frame.pack(fill=tk.X)
-    button_frame.columnconfigure(0, weight=1)
+    create_status = tk.StringVar(value="")
+    status_label = ttk.Label(form_frame, textvariable=create_status, style="Muted.TLabel")
+    status_label.grid(row=3, column=0, sticky="w", pady=(10, 0))
 
     def on_create():
         project_name = name_var.get().strip()
@@ -744,17 +1037,225 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
             )
         except Exception as exc:
             messagebox.showerror("Generation failed", str(exc))
+            create_status.set(f"Failed: {exc}")
             return
 
         messagebox.showinfo("Project created", f"Project created at:\n{out_dir}")
-        root.destroy()
+        create_status.set(f"Project created at {out_dir}")
 
-    ttk.Button(button_frame, text="Create Project", command=on_create).grid(row=0, column=1, sticky="e")
-    ttk.Button(button_frame, text="Cancel", command=root.destroy).grid(row=0, column=2, sticky="e", padx=(8, 0))
+    actions = ttk.Frame(create_page, style="Content.TFrame")
+    actions.grid(row=2, column=0, sticky="e", pady=(12, 0))
+    ttk.Button(actions, text="Create Project", style="Accent.TButton", command=on_create).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(actions, text="Close", style="Ghost.TButton", command=root.destroy).grid(row=0, column=1)
+
+    pages["create"] = create_page
+
+    # Editor Page
+    editor_page = ttk.Frame(content, style="Content.TFrame")
+    editor_page.columnconfigure(0, weight=1)
+    editor_page.rowconfigure(1, weight=1)
+
+    editor_header_row = ttk.Frame(editor_page, style="Content.TFrame")
+    editor_header_row.grid(row=0, column=0, sticky="ew")
+    editor_header_row.columnconfigure(0, weight=1)
+    editor_header_row.columnconfigure(1, weight=0)
+    editor_header = ttk.Label(editor_header_row, text="Edit project configuration", style="Header.TLabel")
+    editor_header.grid(row=0, column=0, sticky="w")
+    editor_hint = ttk.Label(editor_header_row, text="Open mingw_winrt.json to update capabilities, assets, and metadata.", style="Muted.TLabel")
+    editor_hint.grid(row=0, column=1, sticky="e")
+
+    editor_card = create_card(editor_page, "Project config")
+    editor_card.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+
+    editor_path_var = tk.StringVar(value="")
+    editor_entry = ttk.Entry(editor_card, textvariable=editor_path_var)
+
+    def browse_config():
+        path = filedialog.askopenfilename()
+        if path:
+            editor_path_var.set(path)
+
+    def open_editor():
+        path = editor_path_var.get().strip()
+        if not path:
+            messagebox.showerror("Missing config", "Select a mingw_winrt.json file first.")
+            return
+        config_path = Path(path)
+        if not config_path.exists():
+            messagebox.showerror("Missing config", f"Config not found: {config_path}")
+            return
+        edit_project_config_gui(config_path, parent=root)
+
+    add_row(editor_card, 0, "Config file", editor_entry, ttk.Button(editor_card, text="Browse", style="Ghost.TButton", command=browse_config))
+    ttk.Button(editor_page, text="Open Editor", style="Accent.TButton", command=open_editor).grid(row=2, column=0, sticky="e", pady=(12, 0))
+
+    pages["editor"] = editor_page
+
+    # Runner / Installer Page
+    runner_page = ttk.Frame(content, style="Content.TFrame")
+    runner_page.columnconfigure(0, weight=1)
+    runner_page.rowconfigure(3, weight=1)
+
+    runner_header_row = ttk.Frame(runner_page, style="Content.TFrame")
+    runner_header_row.grid(row=0, column=0, sticky="ew")
+    runner_header_row.columnconfigure(0, weight=1)
+    runner_header_row.columnconfigure(1, weight=0)
+    runner_header = ttk.Label(runner_header_row, text="Run / Install loose apps", style="Header.TLabel")
+    runner_header.grid(row=0, column=0, sticky="w")
+    runner_hint = ttk.Label(runner_header_row, text="Register AppxManifest.xml locally or deploy to a device portal share.", style="Muted.TLabel")
+    runner_hint.grid(row=0, column=1, sticky="e")
+
+    local_card = create_card(runner_page, "Local register & run")
+    local_card.grid(row=1, column=0, sticky="ew", pady=(12, 8))
+
+    device_card = create_card(runner_page, "Remote device portal (loose folder)")
+    device_card.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+
+    log_card = create_card(runner_page, "Output")
+    log_card.grid(row=3, column=0, sticky="nsew")
+    log_card.columnconfigure(0, weight=1)
+    log_card.rowconfigure(0, weight=1)
+
+    build_dir_var = tk.StringVar(value=str(Path.cwd()))
+    build_dir_entry = ttk.Entry(local_card, textvariable=build_dir_var)
+
+    manifest_status = tk.StringVar(value="Select a build folder that contains AppxManifest.xml.")
+    manifest_label = ttk.Label(local_card, textvariable=manifest_status, style="Muted.TLabel")
+
+    launch_after_var = tk.BooleanVar(value=True)
+
+    def append_log(message: str):
+        log_text.configure(state="normal")
+        log_text.insert(tk.END, message.rstrip() + "\n")
+        log_text.see(tk.END)
+        log_text.configure(state="disabled")
+
+    current_manifest = {"path": None, "identity": "", "app_id": "", "config": None}
+
+    def update_manifest_state(path: Optional[Path]):
+        current_manifest["path"] = None
+        current_manifest["identity"] = ""
+        current_manifest["app_id"] = ""
+        current_manifest["config"] = None
+        if not path:
+            manifest_status.set("Select a build folder that contains AppxManifest.xml.")
+            return
+        manifest_path = _find_appx_manifest(path)
+        if not manifest_path:
+            manifest_status.set("No AppxManifest.xml found in this folder.")
+            return
+        identity_name, app_id = _read_manifest_identity(manifest_path)
+        current_manifest["path"] = manifest_path
+        current_manifest["identity"] = identity_name
+        current_manifest["app_id"] = app_id
+        config_path = _resolve_project_config_for_dir(path)
+        current_manifest["config"] = config_path
+        manifest_status.set(f"Manifest OK: {manifest_path.name}")
+        portal = _read_device_portal_settings(config_path)
+        ip_var.set(portal.get("ip", ""))
+        username_var.set(portal.get("username", ""))
+        password_var.set(portal.get("password", ""))
+        network_share_var.set(portal.get("networkShare", ""))
+
+    def browse_build_dir():
+        path = filedialog.askdirectory()
+        if path:
+            build_dir_var.set(path)
+            update_manifest_state(Path(path))
+
+    def register_and_run():
+        if not current_manifest["path"]:
+            messagebox.showerror("Missing manifest", "Select a build folder with AppxManifest.xml first.")
+            return
+        append_log("== Registering appx (loose) ==")
+        ok, output = _register_appx(current_manifest["path"])
+        if output:
+            append_log(output)
+        if not ok:
+            append_log("Registration failed.")
+            return
+        append_log("Registration completed.")
+        if launch_after_var.get():
+            append_log("Launching app...")
+            launch_ok, launch_output = _launch_app(current_manifest["identity"], current_manifest["app_id"])
+            if launch_output:
+                append_log(launch_output)
+            if launch_ok:
+                append_log("App launched. Collecting recent runtime logs...")
+                logs = _collect_runtime_logs(current_manifest["identity"], minutes=10)
+                if logs:
+                    append_log(logs)
+            else:
+                append_log("Failed to launch app.")
+
+    add_row(local_card, 0, "Build folder", build_dir_entry, ttk.Button(local_card, text="Browse", style="Ghost.TButton", command=browse_build_dir))
+    manifest_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    ttk.Checkbutton(local_card, text="Launch after register", variable=launch_after_var).grid(row=2, column=0, sticky="w", pady=(0, 6))
+    ttk.Button(local_card, text="Register & Run", style="Accent.TButton", command=register_and_run).grid(row=2, column=2, sticky="e")
+
+    ip_var = tk.StringVar(value="")
+    username_var = tk.StringVar(value="")
+    password_var = tk.StringVar(value="")
+    network_share_var = tk.StringVar(value="")
+
+    update_manifest_state(Path(build_dir_var.get()))
+
+    add_row(device_card, 0, "Device IP / host", ttk.Entry(device_card, textvariable=ip_var))
+    add_row(device_card, 1, "Username", ttk.Entry(device_card, textvariable=username_var))
+    add_row(device_card, 2, "Password", ttk.Entry(device_card, textvariable=password_var, show="*"))
+    add_row(device_card, 3, "Network share (\\\\host\\share\\path)", ttk.Entry(device_card, textvariable=network_share_var))
+
+    def save_portal_settings():
+        settings = {
+            "ip": ip_var.get().strip(),
+            "username": username_var.get().strip(),
+            "password": password_var.get().strip(),
+            "networkShare": network_share_var.get().strip(),
+        }
+        _save_device_portal_settings(current_manifest.get("config"), settings)
+
+    def deploy_remote():
+        if not current_manifest["path"]:
+            messagebox.showerror("Missing manifest", "Select a build folder with AppxManifest.xml first.")
+            return
+        save_portal_settings()
+        append_log("== Deploying loose folder to device portal ==")
+        ok, output = _deploy_loose_remote(
+            network_share_var.get().strip(),
+            ip_var.get().strip(),
+            username_var.get().strip(),
+            password_var.get().strip(),
+        )
+        if output:
+            append_log(output)
+        if ok:
+            append_log("Remote deploy accepted.")
+        else:
+            append_log("Remote deploy failed.")
+
+    actions_row = ttk.Frame(device_card, style="Content.TFrame")
+    actions_row.grid(row=4, column=0, columnspan=3, sticky="e", pady=(10, 0))
+    ttk.Button(actions_row, text="Save Settings", style="Ghost.TButton", command=save_portal_settings).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(actions_row, text="Deploy to Device", style="Accent.TButton", command=deploy_remote).grid(row=0, column=1)
+
+    log_text = tk.Text(log_card, height=10, background=colors["panel"], foreground=colors["text"], insertbackground=colors["text"], borderwidth=0)
+    log_text.configure(state="disabled")
+    log_scroll = ttk.Scrollbar(log_card, orient=tk.VERTICAL, command=log_text.yview)
+    log_text.configure(yscrollcommand=log_scroll.set)
+    log_text.grid(row=0, column=0, sticky="nsew")
+    log_scroll.grid(row=0, column=1, sticky="ns")
+
+    pages["runner"] = runner_page
+
+    add_nav_button("create", "New Project")
+    add_nav_button("editor", "Editor")
+    add_nav_button("runner", "Runner / Installer")
+
+    show_page("create")
 
     root.mainloop()
 
-def edit_project_config_gui(config_path: Path) -> None:
+def edit_project_config_gui(config_path: Path, parent=None) -> None:
     data = _load_config(config_path)
     project_dir = _resolve_project_dir(config_path, data)
     manifest_paths = _get_manifest_paths(project_dir)
@@ -769,10 +1270,12 @@ def edit_project_config_gui(config_path: Path) -> None:
         _error(f"Failed to start GUI: {exc}")
         sys.exit(1)
 
-    root = tk.Tk()
+    owning_root = parent is None
+    root = tk.Tk() if owning_root else tk.Toplevel(parent)
     root.title("MinGW WinRT Project Editor")
     root.geometry("800x760")
     root.resizable(True, True)
+    _apply_vs_style(root)
 
     header = ttk.Label(root, text="Edit MinGW WinRT project", font=("Segoe UI", 14, "bold"))
     header.pack(pady=(16, 6))
@@ -929,7 +1432,77 @@ def edit_project_config_gui(config_path: Path) -> None:
     ttk.Button(button_frame, text="Save", command=on_save).grid(row=0, column=1, sticky="e")
     ttk.Button(button_frame, text="Cancel", command=root.destroy).grid(row=0, column=2, sticky="e", padx=(8, 0))
 
-    root.mainloop()
+    if owning_root:
+        root.mainloop()
+
+def _run_install_cli(argv) -> None:
+    parser = argparse.ArgumentParser(description="Run or deploy a loose Appx build")
+    parser.add_argument("build_dir", help="Directory containing AppxManifest.xml")
+    parser.add_argument("--no-launch", action="store_true", help="Do not launch after registering")
+    parser.add_argument("--remote", action="store_true", help="Deploy to a remote device portal via network share")
+    parser.add_argument("--ip", default="", help="Device portal IP or host (optional if saved in config)")
+    parser.add_argument("--username", default="", help="Device portal username")
+    parser.add_argument("--password", default="", help="Device portal password")
+    parser.add_argument("--network-share", default="", help="UNC path to the loose app share (\\\\host\\share\\path)")
+    args = parser.parse_args(argv)
+
+    build_dir = Path(args.build_dir).expanduser().resolve()
+    manifest_path = _find_appx_manifest(build_dir)
+    if not manifest_path:
+        _error(f"AppxManifest.xml not found in {build_dir}")
+        sys.exit(1)
+
+    config_path = _resolve_project_config_for_dir(build_dir)
+    saved = _read_device_portal_settings(config_path)
+    ip = args.ip or saved.get("ip", "")
+    username = args.username or saved.get("username", "")
+    password = args.password or saved.get("password", "")
+    network_share = args.network_share or saved.get("networkShare", "")
+
+    if config_path and (ip or username or password or network_share):
+        _save_device_portal_settings(config_path, {
+            "ip": ip,
+            "username": username,
+            "password": password,
+            "networkShare": network_share,
+        })
+
+    if args.remote:
+        _info("Deploying loose folder to device portal...")
+        ok, output = _deploy_loose_remote(network_share, ip, username, password)
+        if output:
+            print(output)
+        if ok:
+            _success("Remote deploy accepted.")
+            return
+        _error("Remote deploy failed.")
+        sys.exit(1)
+
+    _info("Registering AppxManifest.xml locally...")
+    ok, output = _register_appx(manifest_path)
+    if output:
+        print(output)
+    if not ok:
+        _error("Registration failed.")
+        sys.exit(1)
+    _success("Registration completed.")
+
+    if args.no_launch:
+        return
+
+    identity_name, app_id = _read_manifest_identity(manifest_path)
+    _info("Launching app...")
+    launch_ok, launch_output = _launch_app(identity_name, app_id)
+    if launch_output:
+        print(launch_output)
+    if not launch_ok:
+        _error("Failed to launch app.")
+        sys.exit(1)
+
+    logs = _collect_runtime_logs(identity_name, minutes=10)
+    if logs:
+        print("\n=== Runtime Logs ===")
+        print(logs)
 
 def main():
     parser = argparse.ArgumentParser(description='Generate MinGW UWP projects (loose files)')
@@ -959,6 +1532,21 @@ def main():
             images_dir=images_dir,
         )
         return
+
+    if len(sys.argv) >= 2:
+        first = sys.argv[1].lower()
+        if first in RUN_ALIASES:
+            if len(sys.argv) < 3:
+                _error("Missing build directory for run/install.")
+                sys.exit(1)
+            _run_install_cli(sys.argv[2:])
+            return
+        if len(sys.argv) == 2 and Path(sys.argv[1]).is_dir():
+            _run_install_cli(sys.argv[1:])
+            return
+        if len(sys.argv) >= 3 and Path(sys.argv[2]).is_dir() and first not in ('library', 'console', 'xaml', 'corewindow'):
+            _run_install_cli(sys.argv[2:])
+            return
 
     json_args = [arg for arg in sys.argv[1:] if arg.lower().endswith('.json')]
     if json_args:
