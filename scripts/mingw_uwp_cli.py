@@ -5,6 +5,10 @@ import uuid
 import tempfile
 import os
 import subprocess
+import ctypes
+import csv
+from datetime import datetime, timedelta
+import time
 import base64
 import ssl
 import urllib.request
@@ -810,21 +814,239 @@ def _find_appx_manifest(build_dir: Path) -> Optional[Path]:
             return candidate
     return None
 
-def _read_manifest_identity(manifest_path: Path) -> tuple[str, str]:
+def _read_manifest_launch_info(manifest_path: Path) -> tuple[str, str, str]:
     try:
         tree = ET.parse(str(manifest_path))
         root = tree.getroot()
         identity = root.find('./{*}Identity')
         identity_name = identity.get('Name') if identity is not None else ''
         app_id = ''
+        exe_name = ''
         applications = root.find('./{*}Applications')
         if applications is not None:
             app_el = applications.find('./{*}Application')
             if app_el is not None:
                 app_id = app_el.get('Id') or ''
-        return identity_name or '', app_id or ''
+                exe_name = app_el.get('Executable') or ''
+        return identity_name or '', app_id or '', exe_name or ''
     except Exception:
-        return '', ''
+        return '', '', ''
+
+def _read_manifest_identity(manifest_path: Path) -> tuple[str, str]:
+    identity_name, app_id, _ = _read_manifest_launch_info(manifest_path)
+    return identity_name, app_id
+
+def _normalize_exe_name(exe_name: str) -> str:
+    if not exe_name:
+        return ''
+    name = Path(exe_name).name
+    if not name:
+        return ''
+    if not name.lower().endswith('.exe'):
+        name += '.exe'
+    return name
+
+def _get_process_ids_by_name(exe_name: str) -> list[int]:
+    if not WINDOWS:
+        return []
+    exe = _normalize_exe_name(exe_name)
+    if not exe:
+        return []
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {exe}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+    if completed.returncode != 0:
+        return []
+    pids = []
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = next(csv.reader([line]))
+        except Exception:
+            continue
+        if len(row) < 2:
+            continue
+        pid_text = row[1].strip()
+        if pid_text.isdigit():
+            pids.append(int(pid_text))
+    return pids
+
+def _collect_runtime_logs_since(identity_name: str, since_time: datetime, limit: int = 50) -> str:
+    if not identity_name:
+        return "Package identity not found; cannot filter runtime logs."
+    if not WINDOWS:
+        return "Runtime log collection is only available on Windows."
+    since_iso = since_time.strftime("%Y-%m-%dT%H:%M:%S")
+    script = (
+        "$pkg = Get-AppxPackage -Name \"{name}\" | Select-Object -First 1;"
+        "if (-not $pkg) {{ exit 0 }};"
+        "$family = [regex]::Escape($pkg.PackageFamilyName);"
+        "$start = [datetime]::Parse(\"{since}\");"
+        "try {{"
+        "  $events = Get-WinEvent -ErrorAction Stop -FilterHashtable @{{LogName='Microsoft-Windows-AppModel-Runtime/Admin'; StartTime=$start}} "
+        "    | Where-Object {{ $_.Message -match $family }} | Sort-Object TimeCreated;"
+        "}} catch {{ exit 0 }};"
+        "if (-not $events) {{ exit 0 }};"
+        "$events | Select-Object -First {limit} | Format-List TimeCreated, Id, LevelDisplayName, Message"
+    ).format(name=identity_name.replace('"', '\\"'), since=since_iso, limit=limit)
+    _, output = _run_powershell(script)
+    return output.strip()
+
+def _tail_runtime_logs(identity_name: str, stop_event: threading.Event, append, poll_seconds: float = 2.0) -> None:
+    if not WINDOWS:
+        append("Runtime log collection is only available on Windows.")
+        return
+    if not identity_name:
+        append("Package identity not found; skipping runtime log capture.")
+        return
+    last_time = datetime.now() - timedelta(seconds=1)
+    while not stop_event.is_set():
+        output = _collect_runtime_logs_since(identity_name, last_time)
+        if output:
+            append(output)
+        last_time = datetime.now()
+        stop_event.wait(poll_seconds)
+
+def _stream_debug_output(stop_event: threading.Event, append, pid_set: Optional[set] = None, pid_lock: Optional[threading.Lock] = None) -> None:
+    if not WINDOWS:
+        append("Debug output capture is only available on Windows.")
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+    except Exception as exc:
+        append(f"Debug output capture unavailable: {exc}")
+        return
+
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    kernel32.CreateFileMappingW.restype = ctypes.c_void_p
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    kernel32.UnmapViewOfFile.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+
+    PAGE_READWRITE = 0x04
+    FILE_MAP_READ = 0x0004
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    h_buffer_ready = kernel32.CreateEventW(None, False, True, "DBWIN_BUFFER_READY")
+    h_data_ready = kernel32.CreateEventW(None, False, False, "DBWIN_DATA_READY")
+    h_map = kernel32.CreateFileMappingW(
+        ctypes.c_void_p(INVALID_HANDLE_VALUE),
+        None,
+        PAGE_READWRITE,
+        0,
+        4096,
+        "DBWIN_BUFFER",
+    )
+    if not h_buffer_ready or not h_data_ready or not h_map:
+        append("Debug output capture unavailable (DBWIN objects).")
+        return
+
+    p_buf = kernel32.MapViewOfFile(h_map, FILE_MAP_READ, 0, 0, 0)
+    if not p_buf:
+        kernel32.CloseHandle(h_map)
+        kernel32.CloseHandle(h_buffer_ready)
+        kernel32.CloseHandle(h_data_ready)
+        append("Debug output capture unavailable (DBWIN map failed).")
+        return
+
+    try:
+        buf = (ctypes.c_byte * 4096).from_address(p_buf)
+        while not stop_event.is_set():
+            kernel32.SetEvent(h_buffer_ready)
+            wait = kernel32.WaitForSingleObject(h_data_ready, 200)
+            if wait == WAIT_TIMEOUT:
+                continue
+            if wait != WAIT_OBJECT_0:
+                break
+            pid = ctypes.c_uint32.from_buffer(buf).value
+            if pid_set is not None and pid_lock is not None:
+                with pid_lock:
+                    if pid_set and pid not in pid_set:
+                        continue
+            msg = bytes(buf[4:]).split(b"\x00", 1)[0]
+            if not msg:
+                continue
+            try:
+                text = msg.decode("mbcs", errors="replace")
+            except Exception:
+                text = msg.decode("utf-8", errors="replace")
+            append(f"[debug pid {pid}] {text}")
+    finally:
+        kernel32.UnmapViewOfFile(ctypes.c_void_p(p_buf))
+        kernel32.CloseHandle(h_map)
+        kernel32.CloseHandle(h_buffer_ready)
+        kernel32.CloseHandle(h_data_ready)
+
+def _stream_logs_until_exit(identity_name: str, exe_name: str, append, stop_event: Optional[threading.Event] = None) -> threading.Event:
+    active_stop = stop_event or threading.Event()
+    exe = _normalize_exe_name(exe_name)
+    pid_lock = threading.Lock()
+    pid_set: set = set()
+
+    def update_pids() -> list:
+        if not exe:
+            return []
+        pids = _get_process_ids_by_name(exe)
+        with pid_lock:
+            pid_set.clear()
+            pid_set.update(pids)
+        return pids
+
+    update_pids()
+    threads = []
+    if exe:
+        debug_thread = threading.Thread(
+            target=_stream_debug_output,
+            args=(active_stop, append, pid_set, pid_lock),
+            daemon=True,
+        )
+        threads.append(debug_thread)
+        debug_thread.start()
+    else:
+        append("Executable name not found; skipping OutputDebugString capture.")
+
+    runtime_thread = threading.Thread(
+        target=_tail_runtime_logs,
+        args=(identity_name, active_stop, append),
+        daemon=True,
+    )
+    threads.append(runtime_thread)
+    runtime_thread.start()
+
+    seen_running = False
+    start_time = time.time()
+    while not active_stop.is_set():
+        pids = update_pids()
+        running = bool(pids)
+        if running and not seen_running:
+            append("Detected app process PID(s): " + ", ".join(str(pid) for pid in pids))
+        if running:
+            seen_running = True
+        if seen_running and not running:
+            break
+        if not seen_running and exe and (time.time() - start_time) > 15:
+            append("App process was not detected; stopping live log capture.")
+            break
+        if not exe and (time.time() - start_time) > 60:
+            break
+        active_stop.wait(0.5)
+
+    active_stop.set()
+    for t in threads:
+        t.join(timeout=1)
+    return active_stop
 
 def _run_powershell(command: str, cwd: Optional[Path] = None) -> tuple[int, str]:
     if not WINDOWS:
@@ -1514,7 +1736,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     runner_header_row.grid(row=0, column=0, sticky="ew")
     runner_header_row.columnconfigure(0, weight=1)
     runner_header_row.columnconfigure(1, weight=0)
-    runner_header = ttk.Label(runner_header_row, text="Run / Install loose apps", style="Header.TLabel")
+    runner_header = ttk.Label(runner_header_row, text="Register / Install loose apps", style="Header.TLabel")
     runner_header.grid(row=0, column=0, sticky="w")
     runner_hint = ttk.Label(runner_header_row, text="Register loose builds, install MSIX packages, or deploy via device portal.", style="Muted.TLabel")
     runner_hint.grid(row=0, column=1, sticky="e")
@@ -1539,8 +1761,6 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     manifest_status = tk.StringVar(value="Select a build folder that contains AppxManifest.xml.")
     manifest_label = ttk.Label(local_card, textvariable=manifest_status, style="Muted.TLabel")
 
-    launch_after_var = tk.BooleanVar(value=True)
-
     def append_log(message: str):
         log_text.configure(state="normal")
         log_text.insert(tk.END, message.rstrip() + "\n")
@@ -1559,7 +1779,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
                     append_log_async(done_label)
         threading.Thread(target=_runner, daemon=True).start()
 
-    current_manifest = {"path": None, "identity": "", "app_id": "", "config": None}
+    current_manifest = {"path": None, "identity": "", "app_id": "", "exe": "", "config": None}
     settings_config_state = {"path": None}
     settings_config_var = tk.StringVar(value="")
 
@@ -1580,6 +1800,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         current_manifest["path"] = None
         current_manifest["identity"] = ""
         current_manifest["app_id"] = ""
+        current_manifest["exe"] = ""
         current_manifest["config"] = None
         if not path:
             manifest_status.set("Select a build folder that contains AppxManifest.xml.")
@@ -1588,10 +1809,11 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         if not manifest_path:
             manifest_status.set("No AppxManifest.xml found in this folder.")
             return
-        identity_name, app_id = _read_manifest_identity(manifest_path)
+        identity_name, app_id, exe_name = _read_manifest_launch_info(manifest_path)
         current_manifest["path"] = manifest_path
         current_manifest["identity"] = identity_name
         current_manifest["app_id"] = app_id
+        current_manifest["exe"] = exe_name
         config_path = _resolve_project_config_for_dir(path)
         current_manifest["config"] = config_path
         manifest_status.set(f"Manifest OK: {manifest_path.name}")
@@ -1603,30 +1825,23 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
             build_dir_var.set(path)
             update_manifest_state(Path(path))
 
-    def register_and_run():
+    def register_loose():
         if not current_manifest["path"]:
             messagebox.showerror("Missing manifest", "Select a build folder with AppxManifest.xml first.")
             return
+        manifest_path = current_manifest["path"]
         append_log("== Registering appx (loose) ==")
-        ok, output = _register_appx(current_manifest["path"])
-        if output:
-            append_log(output)
-        if not ok:
-            append_log("Registration failed.")
-            return
-        append_log("Registration completed.")
-        if launch_after_var.get():
-            append_log("Launching app...")
-            launch_ok, launch_output = _launch_app(current_manifest["identity"], current_manifest["app_id"])
-            if launch_output:
-                append_log(launch_output)
-            if launch_ok:
-                append_log("App launched. Collecting recent runtime logs...")
-                logs = _collect_runtime_logs(current_manifest["identity"], minutes=10)
-                if logs:
-                    append_log(logs)
-            else:
-                append_log("Failed to launch app.")
+
+        def _task():
+            ok, output = _register_appx(manifest_path)
+            if output:
+                append_log_async(output)
+            if not ok:
+                append_log_async("Registration failed.")
+                return
+            append_log_async("Registration completed.")
+
+        run_async(_task)
 
     add_row(local_card, 0, "Build folder", build_dir_entry, ttk.Button(local_card, text="Browse", style="Ghost.TButton", command=browse_build_dir))
     manifest_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
@@ -1655,9 +1870,11 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
 
         run_async(_task)
 
-    ttk.Checkbutton(local_card, text="Launch after register", variable=launch_after_var).grid(row=2, column=0, sticky="w", pady=(0, 6))
-    ttk.Button(local_card, text="Register & Run", style="Accent.TButton", command=register_and_run).grid(row=2, column=2, sticky="e")
-    ttk.Button(local_card, text="Deploy to Device", style="Ghost.TButton", command=deploy_loose).grid(row=3, column=2, sticky="e", pady=(0, 6))
+    local_actions = ttk.Frame(local_card, style="Content.TFrame")
+    local_actions.grid(row=2, column=0, columnspan=3, sticky="e", pady=(0, 6))
+    ttk.Button(local_actions, text="Register", style="Accent.TButton", command=register_loose).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(local_actions, text="Deploy to Device", style="Ghost.TButton", command=deploy_loose).grid(row=0, column=1, padx=(0, 8))
+    ttk.Button(local_actions, text="Get WinDbg", style="Ghost.TButton", command=lambda: webbrowser.open("https://aka.ms/windbg/download")).grid(row=0, column=2)
 
     msix_path_var = tk.StringVar(value="")
     msix_status = tk.StringVar(value="Select a .msix/.appx package to install or deploy.")
