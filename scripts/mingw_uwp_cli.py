@@ -193,6 +193,20 @@ If you build with MinGW GCC 15 on macOS/Linux and see a coroutine_handle error i
 cmake -S . -B build -DMINGW_WINRT_COROUTINE_ALIAS_FIX=ON
 ```
 
+## Complete MacOS cross compile example:
+
+```powershell
+cmake -S . -B build \
+-DCMAKE_SYSTEM_NAME=Windows \
+-DCMAKE_C_COMPILER=/opt/homebrew/bin/x86_64-w64-mingw32-gcc \
+-DCMAKE_CXX_COMPILER=/opt/homebrew/bin/x86_64-w64-mingw32-g++ \
+-DMINGW_USE_WINRT=ON \
+-DMINGW_WINRT_FORCE_FROZEN_SDK=ON \
+-DMINGW_WINRT_SYSROOT=/opt/homebrew/opt/mingw-w64/x86_64-w64-mingw32/sys-root/mingw \
+-DMINGW_WINRT_COROUTINE_ALIAS_FIX=ON \
+-DAPPX_ARCH_OVERRIDE=x64
+```
+
 This applies a build-directory-only workaround. Windows builds do not need it.
 """
     (out_dir / 'README.md').write_text(readme, encoding='utf-8')
