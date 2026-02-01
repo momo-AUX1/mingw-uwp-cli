@@ -466,6 +466,571 @@ def generate_project(template_dir: Path, project_type: str, project_name: str, o
         except Exception:
             pass
 
+def _infer_cmake_defaults(cmake_path: Path) -> tuple[str, str]:
+    try:
+        text = cmake_path.read_text(encoding='utf-8')
+    except Exception:
+        return "", ""
+
+    project_name = ""
+    target_name = ""
+
+    project_match = re.search(r'(?im)^[ \t]*project\s*\(\s*([^\s\)]+)', text)
+    if project_match:
+        project_name = project_match.group(1).strip().strip('"').strip("'")
+
+    target_match = re.search(r'(?im)^[ \t]*add_executable\s*\(\s*([^\s\)]+)', text)
+    if target_match:
+        target_name = target_match.group(1).strip().strip('"').strip("'")
+        if target_name in ("${PROJECT_NAME}", "PROJECT_NAME") and project_name:
+            target_name = project_name
+
+    if not target_name and project_name:
+        target_name = project_name
+
+    return project_name, target_name
+
+def _copy_default_images(dest_images: Path) -> None:
+    src_images = REPO_ROOT / 'templates' / 'corewindow' / 'Images'
+    if not src_images.exists():
+        raise FileNotFoundError(f"Default Images not found at {src_images}")
+    shutil.copytree(src_images, dest_images, dirs_exist_ok=True)
+
+def _write_port_manifest(manifest_path: Path) -> None:
+    manifest = """<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  IgnorableNamespaces="uap">
+
+  <Identity Name="@MINGW_UWP_PACKAGE_NAME@" Publisher="@MINGW_UWP_PUBLISHER@" Version="1.0.0.0" ProcessorArchitecture="@APPX_ARCHITECTURE@" />
+
+  <Properties>
+    <DisplayName>@MINGW_UWP_DISPLAY_NAME@</DisplayName>
+    <PublisherDisplayName>@MINGW_UWP_DISPLAY_NAME@</PublisherDisplayName>
+    <Logo>Images\\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+  </Capabilities>
+
+  <Applications>
+    <Application Id="@MINGW_UWP_APP_ID@" Executable="@MINGW_UWP_EXECUTABLE@" EntryPoint="@MINGW_UWP_ENTRYPOINT@">
+      <uap:VisualElements
+        DisplayName="@MINGW_UWP_DISPLAY_NAME@"
+        Description="@MINGW_UWP_DISPLAY_NAME@"
+        BackgroundColor="transparent"
+        Square150x150Logo="Images\\Square150x150Logo.png"
+        Square44x44Logo="Images\\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Images\\Wide310x150Logo.png" />
+        <uap:SplashScreen Image="Images\\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+</Package>
+"""
+    manifest_path.write_text(manifest, encoding='utf-8')
+
+def _write_port_module(module_path: Path, default_package: str, default_publisher: str) -> None:
+    template = """# MinGW UWP port module
+# Include this file from your root CMakeLists.txt and call:
+#   mingw_uwp_setup(<target>)
+#
+# Optional overrides:
+#   set(MINGW_UWP_ENABLE ON)
+#   set(MINGW_UWP_PUBLISHER "CN=YourPublisher")
+#   set(MINGW_UWP_PACKAGE_NAME "Your.Package")
+#   set(MINGW_UWP_DISPLAY_NAME "Your App")
+#   set(MINGW_UWP_NAMESPACE "YourNamespace")
+#   set(MINGW_UWP_ENTRYPOINT "YourNamespace.App")
+#   set(MINGW_UWP_APP_ID "App")
+#   set(MINGW_UWP_USE_DEPS_LIBS ON)
+#   set(MINGW_UWP_DEPS_LIBS "foo;bar")
+
+include(CheckCXXSourceCompiles)
+
+option(MINGW_UWP_ENABLE "Enable MinGW UWP support" OFF)
+
+option(MINGW_WINRT_COROUTINE_ALIAS_FIX "Patch C++/WinRT coroutine alias for GCC/MinGW on non-Windows hosts" OFF)
+
+set(APPX_ARCH_OVERRIDE "" CACHE STRING "Force Appx architecture (x64/x86/arm64/arm) for cross-compiling")
+
+set(_MINGW_UWP_ROOT "${CMAKE_CURRENT_LIST_DIR}")
+
+set(MINGW_UWP_PUBLISHER "__DEFAULT_PUBLISHER__" CACHE STRING "Publisher CN for Appx manifest")
+set(MINGW_UWP_PACKAGE_NAME "__DEFAULT_PACKAGE_NAME__" CACHE STRING "Package name for Appx manifest")
+set(MINGW_UWP_DISPLAY_NAME "__DEFAULT_PACKAGE_NAME__" CACHE STRING "Display name for Appx manifest")
+set(MINGW_UWP_ENTRYPOINT "" CACHE STRING "EntryPoint (namespace.class) for Appx manifest")
+set(MINGW_UWP_APP_ID "App" CACHE STRING "Application Id for Appx manifest")
+set(MINGW_UWP_USE_DEPS_LIBS OFF CACHE BOOL "Auto-link libraries from deps/lib")
+set(MINGW_UWP_DEPS_LIBS "" CACHE STRING "Explicit deps libs to link (semicolon-separated)")
+
+function(_mingw_uwp_setup_impl target)
+  if(NOT TARGET ${target})
+    message(FATAL_ERROR "mingw_uwp_setup: target '${target}' not found.")
+  endif()
+
+  if(APPX_ARCH_OVERRIDE)
+    string(TOLOWER "${APPX_ARCH_OVERRIDE}" _appx_arch_override)
+    if(_appx_arch_override STREQUAL "amd64" OR _appx_arch_override STREQUAL "x64")
+      set(APPX_ARCHITECTURE "x64")
+      set(CMAKE_SYSTEM_PROCESSOR "AMD64" CACHE STRING "Forced for workaround" FORCE)
+    elseif(_appx_arch_override STREQUAL "x86")
+      set(APPX_ARCHITECTURE "x86")
+      set(CMAKE_SYSTEM_PROCESSOR "x86" CACHE STRING "Forced for workaround" FORCE)
+    elseif(_appx_arch_override STREQUAL "arm64")
+      set(APPX_ARCHITECTURE "arm64")
+      set(CMAKE_SYSTEM_PROCESSOR "ARM64" CACHE STRING "Forced for workaround" FORCE)
+    elseif(_appx_arch_override STREQUAL "arm")
+      set(APPX_ARCHITECTURE "arm")
+      set(CMAKE_SYSTEM_PROCESSOR "ARM" CACHE STRING "Forced for workaround" FORCE)
+    else()
+      message(FATAL_ERROR "Invalid APPX_ARCH_OVERRIDE '${APPX_ARCH_OVERRIDE}' (use x64/x86/arm64/arm)")
+    endif()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
+    set(APPX_ARCHITECTURE "x64")
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86")
+    set(APPX_ARCHITECTURE "x86")
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64")
+    set(APPX_ARCHITECTURE "arm64")
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM")
+    set(APPX_ARCHITECTURE "arm")
+  else()
+    message(FATAL_ERROR "Invalid architecture ${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+
+  message(STATUS "Building for ${APPX_ARCHITECTURE}.")
+
+  get_target_property(_output_name ${target} OUTPUT_NAME)
+  if(NOT _output_name)
+    set(_output_name "${target}")
+  endif()
+
+  set(MINGW_UWP_EXECUTABLE "${_output_name}.exe")
+
+  if(NOT MINGW_UWP_PACKAGE_NAME)
+    set(MINGW_UWP_PACKAGE_NAME "${_output_name}")
+  endif()
+  if(NOT MINGW_UWP_DISPLAY_NAME)
+    set(MINGW_UWP_DISPLAY_NAME "${MINGW_UWP_PACKAGE_NAME}")
+  endif()
+  if(NOT MINGW_UWP_PUBLISHER)
+    set(MINGW_UWP_PUBLISHER "CN=Unknown")
+  endif()
+
+  if(NOT DEFINED MINGW_UWP_NAMESPACE OR "${MINGW_UWP_NAMESPACE}" STREQUAL "")
+    set(_namespace "${MINGW_UWP_PACKAGE_NAME}")
+    string(REGEX REPLACE "[^0-9A-Za-z_]" "" _namespace "${_namespace}")
+    if(_namespace STREQUAL "")
+      set(_namespace "App")
+    endif()
+    string(REGEX MATCH "^[0-9]" _namespace_starts_digit "${_namespace}")
+    if(_namespace_starts_digit)
+      set(_namespace "_${_namespace}")
+    endif()
+    set(MINGW_UWP_NAMESPACE "${_namespace}")
+  endif()
+
+  if(NOT MINGW_UWP_ENTRYPOINT)
+    set(MINGW_UWP_ENTRYPOINT "${MINGW_UWP_NAMESPACE}.App")
+  endif()
+  if(NOT MINGW_UWP_APP_ID)
+    set(MINGW_UWP_APP_ID "App")
+  endif()
+
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /EHsc)
+    target_link_options(${target} PRIVATE /APPCONTAINER)
+    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE)
+  else()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|AMD64")
+      target_compile_options(${target} PRIVATE -mcx16)
+    endif()
+    target_link_options(${target} PRIVATE -municode -static)
+
+    set(_prev_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "-Wl,--appcontainer")
+    check_cxx_source_compiles("int wWinMain(void) {return 0;}" LINKER_SUPPORTS_APPCONTAINER_FLAG)
+    set(CMAKE_REQUIRED_FLAGS "${_prev_required_flags}")
+    if(LINKER_SUPPORTS_APPCONTAINER_FLAG)
+      target_link_options(${target} PRIVATE -Wl,--appcontainer)
+    endif()
+  endif()
+
+  if(EXISTS "${_MINGW_UWP_ROOT}/Images")
+    file(COPY "${_MINGW_UWP_ROOT}/Images" DESTINATION ${CMAKE_BINARY_DIR})
+  else()
+    message(WARNING "Images directory not found at ${_MINGW_UWP_ROOT}/Images")
+  endif()
+  if(NOT EXISTS "${_MINGW_UWP_ROOT}/AppxManifest.in")
+    message(FATAL_ERROR "AppxManifest.in not found at ${_MINGW_UWP_ROOT}/AppxManifest.in")
+  endif()
+  configure_file("${_MINGW_UWP_ROOT}/AppxManifest.in" "${CMAKE_BINARY_DIR}/AppxManifest.xml" @ONLY)
+
+  if(EXISTS "${_MINGW_UWP_ROOT}/deps/bin")
+    file(GLOB _deps_bins "${_MINGW_UWP_ROOT}/deps/bin/*")
+    if(_deps_bins)
+      file(COPY ${_deps_bins} DESTINATION ${CMAKE_BINARY_DIR})
+    endif()
+  endif()
+
+  if(EXISTS "${_MINGW_UWP_ROOT}/deps/include")
+    target_include_directories(${target} PRIVATE "${_MINGW_UWP_ROOT}/deps/include")
+  endif()
+
+  if(MINGW_UWP_DEPS_LIBS)
+    target_link_libraries(${target} PRIVATE ${MINGW_UWP_DEPS_LIBS})
+  elseif(MINGW_UWP_USE_DEPS_LIBS AND EXISTS "${_MINGW_UWP_ROOT}/deps/lib")
+    file(GLOB _deps_libs "${_MINGW_UWP_ROOT}/deps/lib/*.lib" "${_MINGW_UWP_ROOT}/deps/lib/*.a")
+    if(_deps_libs)
+      target_link_libraries(${target} PRIVATE ${_deps_libs})
+    endif()
+  endif()
+
+  if(NOT MSVC)
+    if(APPX_ARCHITECTURE STREQUAL "x64")
+      target_compile_definitions(${target} PRIVATE _AMD64 _M_AMD64 _WIN64 _M_X64)
+    elseif(APPX_ARCHITECTURE STREQUAL "x86")
+      target_compile_definitions(${target} PRIVATE _X86 _M_IX86 _WIN32)
+    elseif(APPX_ARCHITECTURE STREQUAL "arm64")
+      target_compile_definitions(${target} PRIVATE _ARM64)
+    elseif(APPX_ARCHITECTURE STREQUAL "arm")
+      target_compile_definitions(${target} PRIVATE _ARM)
+    endif()
+  endif()
+
+  target_compile_definitions(${target} PRIVATE __WINRT__)
+
+  target_link_libraries(${target} PRIVATE windowsapp)
+
+  if(NOT MSVC)
+    include(FetchContent)
+    set(MINGW_USE_WINRT ON)
+    set(MINGW_WINRT_FORCE_FROZEN_SDK ON)
+    FetchContent_Declare(MinGWWinRT GIT_REPOSITORY https://github.com/momo-AUX1/cmake-mingw-winrt.git GIT_TAG main)
+    FetchContent_MakeAvailable(MinGWWinRT)
+
+    set(_mingw_winrt_hint "")
+    if(DEFINED ENV{MINGW_WINRT_DIR})
+      set(_mingw_winrt_hint "$ENV{MINGW_WINRT_DIR}")
+    endif()
+    if(NOT DEFINED MinGWWinRT_SOURCE_DIR OR "${MinGWWinRT_SOURCE_DIR}" STREQUAL "")
+      if(NOT "${_mingw_winrt_hint}" STREQUAL "" AND EXISTS "${_mingw_winrt_hint}/MinGWWinRT.cmake")
+        set(MinGWWinRT_SOURCE_DIR "${_mingw_winrt_hint}")
+      elseif(EXISTS "${CMAKE_BINARY_DIR}/_deps/mingwwinrt-src/MinGWWinRT.cmake")
+        set(MinGWWinRT_SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/mingwwinrt-src")
+      endif()
+    endif()
+
+    if(DEFINED MinGWWinRT_SOURCE_DIR AND NOT "${MinGWWinRT_SOURCE_DIR}" STREQUAL "")
+      include("${MinGWWinRT_SOURCE_DIR}/MinGWWinRT.cmake")
+      if(MINGW_WINRT_COROUTINE_ALIAS_FIX AND NOT CMAKE_HOST_WIN32)
+        set(_winrt_header "${CMAKE_BINARY_DIR}/_deps/mingwwinrt-src/winrt/include/winrt/Windows.Foundation.h")
+        if(EXISTS "${_winrt_header}")
+          file(READ "${_winrt_header}" _winrt_contents)
+          if(_winrt_contents MATCHES "using coroutine_handle = impl::coroutine_handle<>;"
+             AND NOT _winrt_contents MATCHES "using coroutine_handle_t = impl::coroutine_handle<>;")
+            string(REPLACE "using coroutine_handle = impl::coroutine_handle<>;"
+                           "using coroutine_handle_t = impl::coroutine_handle<>;"
+                           _winrt_contents "${_winrt_contents}")
+            string(REPLACE "coroutine_handle handle" "coroutine_handle_t handle" _winrt_contents "${_winrt_contents}")
+            string(REPLACE "coroutine_handle resume" "coroutine_handle_t resume" _winrt_contents "${_winrt_contents}")
+            string(REPLACE "coroutine_handle m_handle" "coroutine_handle_t m_handle" _winrt_contents "${_winrt_contents}")
+            file(WRITE "${_winrt_header}" "${_winrt_contents}")
+            message(STATUS "Applied WinRT coroutine alias workaround for MinGW GCC.")
+          endif()
+        endif()
+      endif()
+    else()
+      message(FATAL_ERROR "MinGWWinRT not found. Ensure network access for FetchContent.")
+    endif()
+  endif()
+
+  set(SIGNING_CERTIFICATE "" CACHE STRING "Path to a .pfx certificate to sign the Appx (optional)")
+  set(SIGNING_CERT_PASSWORD "" CACHE STRING "Password for the .pfx certificate (optional)")
+
+  find_program(MAKEAPPX_EXE NAMES makeappx.exe makeappx MakeAppx.exe MakeAppx)
+  find_program(SIGNTOOL_EXE NAMES signtool.exe signtool SignTool.exe SignTool)
+
+  if(NOT MAKEAPPX_EXE)
+    set(_pf86 "")
+    if(NOT "$ENV{ProgramFiles}" STREQUAL "")
+      set(_pf_candidate "$ENV{ProgramFiles}")
+      if(EXISTS "${_pf_candidate}/Windows Kits/10/bin")
+        set(_pf86 "${_pf_candidate}")
+      endif()
+    endif()
+    if(_pf86 STREQUAL "" AND NOT "$ENV{ProgramW6432}" STREQUAL "")
+      set(_pf_candidate "$ENV{ProgramW6432}")
+      if(EXISTS "${_pf_candidate}/Windows Kits/10/bin")
+        set(_pf86 "${_pf_candidate}")
+      endif()
+    endif()
+    if(_pf86 STREQUAL "")
+      set(_pf_candidate "C:/Program Files (x86)")
+      if(EXISTS "${_pf_candidate}/Windows Kits/10/bin")
+        set(_pf86 "${_pf_candidate}")
+      endif()
+    endif()
+    if(NOT _pf86 STREQUAL "")
+      set(_win_kits_dir "${_pf86}/Windows Kits/10/bin")
+      if(EXISTS "${_win_kits_dir}")
+        file(GLOB _versions RELATIVE "${_win_kits_dir}" "${_win_kits_dir}/*")
+        foreach(_v ${_versions})
+          set(_candidate "${_win_kits_dir}/${_v}/${APPX_ARCHITECTURE}/MakeAppx.exe")
+          if(EXISTS "${_candidate}")
+            set(MAKEAPPX_EXE "${_candidate}")
+            message(STATUS "Found MakeAppx at ${MAKEAPPX_EXE}")
+            break()
+          endif()
+          set(_candidate2 "${_win_kits_dir}/${_v}/x64/MakeAppx.exe")
+          if(EXISTS "${_candidate2}")
+            set(MAKEAPPX_EXE "${_candidate2}")
+            message(STATUS "Found MakeAppx at ${MAKEAPPX_EXE}")
+            break()
+          endif()
+        endforeach()
+      endif()
+    endif()
+  endif()
+
+  if(NOT SIGNTOOL_EXE)
+    set(_pf86 "")
+    if(NOT "$ENV{ProgramFiles}" STREQUAL "")
+      set(_pf_candidate "$ENV{ProgramFiles}")
+      if(EXISTS "${_pf_candidate}/Windows Kits/10/bin")
+        set(_pf86 "${_pf_candidate}")
+      endif()
+    endif()
+    if(_pf86 STREQUAL "" AND NOT "$ENV{ProgramW6432}" STREQUAL "")
+      set(_pf_candidate "$ENV{ProgramW6432}")
+      if(EXISTS "${_pf_candidate}/Windows Kits/10/bin")
+        set(_pf86 "${_pf_candidate}")
+      endif()
+    endif()
+    if(_pf86 STREQUAL "")
+      set(_pf_candidate "C:/Program Files (x86)")
+      if(EXISTS "${_pf_candidate}/Windows Kits/10/bin")
+        set(_pf86 "${_pf_candidate}")
+      endif()
+    endif()
+    if(NOT _pf86 STREQUAL "")
+      set(_win_kits_dir "${_pf86}/Windows Kits/10/bin")
+      if(EXISTS "${_win_kits_dir}")
+        file(GLOB _versions RELATIVE "${_win_kits_dir}" "${_win_kits_dir}/*")
+        foreach(_v ${_versions})
+          set(_candidate "${_win_kits_dir}/${_v}/${APPX_ARCHITECTURE}/signtool.exe")
+          if(EXISTS "${_candidate}")
+            set(SIGNTOOL_EXE "${_candidate}")
+            message(STATUS "Found SignTool at ${SIGNTOOL_EXE}")
+            break()
+          endif()
+          set(_candidate2 "${_win_kits_dir}/${_v}/x64/signtool.exe")
+          if(EXISTS "${_candidate2}")
+            set(SIGNTOOL_EXE "${_candidate2}")
+            message(STATUS "Found SignTool at ${SIGNTOOL_EXE}")
+            break()
+          endif()
+        endforeach()
+      endif()
+    endif()
+  endif()
+
+  if(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(_appx_output_dir "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+  else()
+    set(_appx_output_dir "${CMAKE_CURRENT_BINARY_DIR}")
+  endif()
+
+  set(_appx_file "${CMAKE_BINARY_DIR}/${MINGW_UWP_PACKAGE_NAME}.appx")
+  set(_msix_file "${CMAKE_BINARY_DIR}/${MINGW_UWP_PACKAGE_NAME}.msix")
+
+  if(MAKEAPPX_EXE)
+    if(NOT TARGET appx)
+      add_custom_target(appx
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/appx/Images"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different AppxManifest.xml "$<TARGET_FILE:${target}>" "${CMAKE_BINARY_DIR}/appx"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_MINGW_UWP_ROOT}/Images" "${CMAKE_BINARY_DIR}/appx/Images"
+        COMMAND powershell.exe -NoProfile -Command "& { & '${MAKEAPPX_EXE}' pack /d '${CMAKE_BINARY_DIR}/appx' /p '${_appx_file}' }"
+        DEPENDS ${target}
+      )
+    endif()
+
+    if(SIGNTOOL_EXE)
+      if(SIGNING_CERTIFICATE)
+        if(SIGNING_CERT_PASSWORD)
+          add_custom_command(TARGET appx POST_BUILD
+            COMMAND ${SIGNTOOL_EXE} sign /fd SHA256 /a /f "${SIGNING_CERTIFICATE}" /p "${SIGNING_CERT_PASSWORD}" "${_appx_file}"
+          )
+        else()
+          add_custom_command(TARGET appx POST_BUILD
+            COMMAND ${SIGNTOOL_EXE} sign /fd SHA256 /a /f "${SIGNING_CERTIFICATE}" "${_appx_file}"
+          )
+        endif()
+      else()
+        message(WARNING "SignTool found (${SIGNTOOL_EXE}) but SIGNING_CERTIFICATE not set. Package will not be signed.")
+      endif()
+    else()
+      message(STATUS "MakeAppx found at ${MAKEAPPX_EXE} but SignTool was not found; package will remain unsigned unless you provide SignTool.")
+    endif()
+  else()
+    set(TRY_MAKEAPPX "makeappx.exe")
+    if(MAKEAPPX_EXE)
+      set(TRY_MAKEAPPX "${MAKEAPPX_EXE}")
+    endif()
+
+    if(NOT TARGET appx)
+      add_custom_target(appx
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/appx/Images"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different AppxManifest.xml "$<TARGET_FILE:${target}>" "${CMAKE_BINARY_DIR}/appx"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_MINGW_UWP_ROOT}/Images" "${CMAKE_BINARY_DIR}/appx/Images"
+        COMMAND powershell.exe -NoProfile -Command "& { & '${TRY_MAKEAPPX}' pack /d '${CMAKE_BINARY_DIR}/appx' /p '${_appx_file}' }"
+        DEPENDS ${target}
+      )
+    endif()
+  endif()
+
+  if(TARGET appx)
+    add_custom_command(TARGET appx POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_appx_file}" "${_appx_output_dir}/${MINGW_UWP_PACKAGE_NAME}.appx"
+    )
+  endif()
+
+  if(MAKEAPPX_EXE)
+    if(NOT TARGET msix)
+      add_custom_target(msix
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/msix/Images"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different AppxManifest.xml "$<TARGET_FILE:${target}>" "${CMAKE_BINARY_DIR}/msix"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_MINGW_UWP_ROOT}/Images" "${CMAKE_BINARY_DIR}/msix/Images"
+        COMMAND powershell.exe -NoProfile -Command "& { & '${MAKEAPPX_EXE}' pack /d '${CMAKE_BINARY_DIR}/msix' /p '${_msix_file}' }"
+        DEPENDS ${target}
+      )
+    endif()
+
+    if(SIGNTOOL_EXE)
+      if(SIGNING_CERTIFICATE)
+        if(SIGNING_CERT_PASSWORD)
+          add_custom_command(TARGET msix POST_BUILD
+            COMMAND ${SIGNTOOL_EXE} sign /fd SHA256 /a /f "${SIGNING_CERTIFICATE}" /p "${SIGNING_CERT_PASSWORD}" "${_msix_file}"
+          )
+        else()
+          add_custom_command(TARGET msix POST_BUILD
+            COMMAND ${SIGNTOOL_EXE} sign /fd SHA256 /a /f "${SIGNING_CERTIFICATE}" "${_msix_file}"
+          )
+        endif()
+      else()
+        message(WARNING "SignTool found (${SIGNTOOL_EXE}) but SIGNING_CERTIFICATE not set. MSIX will not be signed.")
+      endif()
+    else()
+      message(STATUS "MakeAppx found at ${MAKEAPPX_EXE} but SignTool was not found; MSIX will remain unsigned unless you provide SignTool.")
+    endif()
+  else()
+    set(TRY_MAKEAPPX "makeappx.exe")
+    if(MAKEAPPX_EXE)
+      set(TRY_MAKEAPPX "${MAKEAPPX_EXE}")
+    endif()
+
+    if(NOT TARGET msix)
+      add_custom_target(msix
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/msix/Images"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different AppxManifest.xml "$<TARGET_FILE:${target}>" "${CMAKE_BINARY_DIR}/msix"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_MINGW_UWP_ROOT}/Images" "${CMAKE_BINARY_DIR}/msix/Images"
+        COMMAND powershell.exe -NoProfile -Command "& { & '${TRY_MAKEAPPX}' pack /d '${CMAKE_BINARY_DIR}/msix' /p '${_msix_file}' }"
+        DEPENDS ${target}
+      )
+    endif()
+  endif()
+
+  if(TARGET msix)
+    add_custom_command(TARGET msix POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_msix_file}" "${_appx_output_dir}/${MINGW_UWP_PACKAGE_NAME}.msix"
+    )
+  endif()
+endfunction()
+
+function(mingw_uwp_setup target)
+  if(MINGW_UWP_ENABLE)
+    _mingw_uwp_setup_impl(${target})
+  else()
+    message(STATUS "MINGW_UWP_ENABLE=OFF; skipping UWP setup for ${target}.")
+  endif()
+endfunction()
+"""
+    module = template.replace("__DEFAULT_PACKAGE_NAME__", default_package).replace("__DEFAULT_PUBLISHER__", default_publisher)
+    module_path.write_text(module, encoding='utf-8')
+
+def _append_cmake_port_snippet(cmake_path: Path, uwp_dir_name: str, target_name: str, use_deps_libs: bool) -> tuple[bool, str]:
+    try:
+        content = cmake_path.read_text(encoding='utf-8')
+    except Exception as exc:
+        return False, f"Failed to read {cmake_path}: {exc}"
+
+    marker = "mingw_uwp_module.cmake"
+    if marker in content:
+        return False, "CMakeLists.txt already references mingw_uwp_module.cmake."
+
+    lines = [
+        "",
+        "# --- MinGW UWP Port (generated by mingw-uwp-cli) ---",
+        f"set(MINGW_UWP_DIR \"${{CMAKE_CURRENT_LIST_DIR}}/{uwp_dir_name}\")",
+        "include(\"${MINGW_UWP_DIR}/mingw_uwp_module.cmake\")",
+        "# set(MINGW_UWP_ENABLE ON) # Enable when building UWP",
+    ]
+    if use_deps_libs:
+        lines.append("set(MINGW_UWP_USE_DEPS_LIBS ON)")
+    lines.append(f"mingw_uwp_setup({target_name})")
+    lines.append("# --- End MinGW UWP Port ---")
+
+    snippet = "\n".join(lines) + "\n"
+    if not content.endswith("\n"):
+        content += "\n"
+    content += snippet
+    cmake_path.write_text(content, encoding='utf-8')
+    return True, ""
+
+def port_existing_project(project_root: Path, cmake_path: Path, target_name: str, package_name: str, publisher: str, uwp_dir_name: str, arch: str, include_msvc_dlls: bool, use_deps_libs: bool, overwrite: bool, patch_cmake: bool) -> tuple[Path, bool, str]:
+    if not project_root.exists() or not project_root.is_dir():
+        raise FileNotFoundError(f"Project directory not found: {project_root}")
+    if not cmake_path.exists():
+        raise FileNotFoundError(f"CMakeLists.txt not found: {cmake_path}")
+
+    uwp_dir_name = uwp_dir_name.strip()
+    if not uwp_dir_name:
+        raise ValueError("UWP folder name is required.")
+    if Path(uwp_dir_name).is_absolute() or len(Path(uwp_dir_name).parts) != 1:
+        raise ValueError("UWP folder name must be a simple directory name.")
+
+    uwp_dir = project_root / uwp_dir_name
+    if uwp_dir.exists() and any(uwp_dir.iterdir()):
+        if overwrite:
+            shutil.rmtree(uwp_dir)
+        else:
+            raise FileExistsError(f"UWP directory already exists and is not empty: {uwp_dir}")
+
+    uwp_dir.mkdir(parents=True, exist_ok=True)
+    _copy_default_images(uwp_dir / 'Images')
+    _write_port_manifest(uwp_dir / 'AppxManifest.in')
+    _write_port_module(uwp_dir / 'mingw_uwp_module.cmake', package_name, publisher or 'CN=Unknown')
+    _ensure_deps_layout(uwp_dir)
+
+    if include_msvc_dlls:
+        _copy_msvc_dlls(uwp_dir, arch)
+
+    modified = False
+    message = ""
+    if patch_cmake:
+        modified, message = _append_cmake_port_snippet(cmake_path, uwp_dir_name, target_name, use_deps_libs)
+
+    return uwp_dir, modified, message
+
 def _load_config(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
@@ -1598,28 +2163,35 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     # Create Project Page
     create_page = ttk.Frame(content, style="Content.TFrame")
     create_page.columnconfigure(0, weight=1)
-    create_page.rowconfigure(1, weight=1)
+    create_page.rowconfigure(2, weight=1)
 
     create_header_row = ttk.Frame(create_page, style="Content.TFrame")
     create_header_row.grid(row=0, column=0, sticky="ew")
     create_header_row.columnconfigure(0, weight=1)
     create_header_row.columnconfigure(1, weight=0)
-    create_header = ttk.Label(create_header_row, text="Create a new MinGW UWP project", style="Header.TLabel")
+    create_header = ttk.Label(create_header_row, text="New Project", style="Header.TLabel")
     create_header.grid(row=0, column=0, sticky="w")
-    create_subtitle = ttk.Label(create_header_row, text="Configure templates, paths, and build settings.", style="Muted.TLabel")
+    create_subtitle = ttk.Label(create_header_row, text="Create a new project or port an existing CMake build.", style="Muted.TLabel")
     create_subtitle.grid(row=0, column=1, sticky="e")
 
-    form_frame = ttk.Frame(create_page, style="Content.TFrame")
-    form_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
-    form_frame.columnconfigure(0, weight=1)
+    mode_frame = ttk.Frame(create_page, style="Content.TFrame")
+    mode_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+    mode_create_btn = ttk.Button(mode_frame, text="Create", style="Accent.TButton", command=lambda: set_create_mode("create"))
+    mode_port_btn = ttk.Button(mode_frame, text="Port", style="Ghost.TButton", command=lambda: set_create_mode("port"))
+    mode_create_btn.grid(row=0, column=0, sticky="w")
+    mode_port_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-    settings_card = create_card(form_frame, "Project settings")
+    create_form_frame = ttk.Frame(create_page, style="Content.TFrame")
+    create_form_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+    create_form_frame.columnconfigure(0, weight=1)
+
+    settings_card = create_card(create_form_frame, "Project settings")
     settings_card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
 
-    paths_card = create_card(form_frame, "Paths")
+    paths_card = create_card(create_form_frame, "Paths")
     paths_card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
 
-    options_card = create_card(form_frame, "Options")
+    options_card = create_card(create_form_frame, "Options")
     options_card.grid(row=2, column=0, sticky="ew")
 
     project_type_var = tk.StringVar(value="xaml")
@@ -1665,7 +2237,7 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
     ttk.Checkbutton(options_card, text="Include MSVC DLLs in deps/bin", variable=include_msvc_var).grid(row=1, column=0, sticky="w", pady=4)
 
     create_status = tk.StringVar(value="")
-    status_label = ttk.Label(form_frame, textvariable=create_status, style="Muted.TLabel")
+    status_label = ttk.Label(create_form_frame, textvariable=create_status, style="Muted.TLabel")
     status_label.grid(row=3, column=0, sticky="w", pady=(10, 0))
 
     def on_create():
@@ -1697,10 +2269,170 @@ def launch_gui(default_template_dir: Path, default_output_dir: Path, default_arc
         messagebox.showinfo("Project created", f"Project created at:\n{out_dir}")
         create_status.set(f"Project created at {out_dir}")
 
-    actions = ttk.Frame(create_page, style="Content.TFrame")
-    actions.grid(row=2, column=0, sticky="e", pady=(12, 0))
-    ttk.Button(actions, text="Create Project", style="Accent.TButton", command=on_create).grid(row=0, column=0, padx=(0, 8))
-    ttk.Button(actions, text="Close", style="Ghost.TButton", command=root.destroy).grid(row=0, column=1)
+    create_actions = ttk.Frame(create_page, style="Content.TFrame")
+    create_actions.grid(row=3, column=0, sticky="e", pady=(12, 0))
+    ttk.Button(create_actions, text="Create Project", style="Accent.TButton", command=on_create).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(create_actions, text="Close", style="Ghost.TButton", command=root.destroy).grid(row=0, column=1)
+
+    # Port Existing Project
+    port_form_frame = ttk.Frame(create_page, style="Content.TFrame")
+    port_form_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+    port_form_frame.columnconfigure(0, weight=1)
+
+    port_settings_card = create_card(port_form_frame, "Port settings")
+    port_settings_card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+    port_paths_card = create_card(port_form_frame, "Paths")
+    port_paths_card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+    port_options_card = create_card(port_form_frame, "Options")
+    port_options_card.grid(row=2, column=0, sticky="ew")
+
+    port_root_var = tk.StringVar(value="")
+    port_root_entry = ttk.Entry(port_paths_card, textvariable=port_root_var)
+    port_root_button = ttk.Button(port_paths_card, text="Browse", style="Ghost.TButton")
+
+    port_cmake_var = tk.StringVar(value="")
+    port_cmake_entry = ttk.Entry(port_paths_card, textvariable=port_cmake_var)
+    port_cmake_button = ttk.Button(port_paths_card, text="Browse", style="Ghost.TButton")
+
+    port_target_var = tk.StringVar(value="")
+    port_target_entry = ttk.Entry(port_settings_card, textvariable=port_target_var)
+
+    port_package_var = tk.StringVar(value="")
+    port_package_entry = ttk.Entry(port_settings_card, textvariable=port_package_var)
+
+    port_publisher_var = tk.StringVar(value=default_publisher)
+    port_publisher_entry = ttk.Entry(port_settings_card, textvariable=port_publisher_var)
+
+    port_uwp_dir_var = tk.StringVar(value="uwp")
+    port_uwp_dir_entry = ttk.Entry(port_settings_card, textvariable=port_uwp_dir_var)
+
+    add_row(port_settings_card, 0, "Target name", port_target_entry)
+    add_row(port_settings_card, 1, "Package name", port_package_entry)
+    add_row(port_settings_card, 2, "Publisher", port_publisher_entry)
+    add_row(port_settings_card, 3, "UWP folder name", port_uwp_dir_entry)
+
+    add_row(port_paths_card, 0, "Project root", port_root_entry, port_root_button)
+    add_row(port_paths_card, 1, "Root CMakeLists.txt", port_cmake_entry, port_cmake_button)
+
+    port_overwrite_var = tk.BooleanVar(value=False)
+    port_include_msvc_var = tk.BooleanVar(value=False)
+    port_use_deps_libs_var = tk.BooleanVar(value=False)
+    port_patch_cmake_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(port_options_card, text="Overwrite UWP folder if it exists", variable=port_overwrite_var).grid(row=0, column=0, sticky="w", pady=4)
+    ttk.Checkbutton(port_options_card, text="Include MSVC DLLs in deps/bin", variable=port_include_msvc_var).grid(row=1, column=0, sticky="w", pady=4)
+    ttk.Checkbutton(port_options_card, text="Auto-link libs in deps/lib", variable=port_use_deps_libs_var).grid(row=2, column=0, sticky="w", pady=4)
+    ttk.Checkbutton(port_options_card, text="Update CMakeLists.txt with module include", variable=port_patch_cmake_var).grid(row=3, column=0, sticky="w", pady=4)
+    ttk.Label(port_options_card, text="UWP folder will include Images/, AppxManifest.in, deps/, and mingw_uwp_module.cmake.", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(6, 0))
+
+    port_status = tk.StringVar(value="")
+    port_status_label = ttk.Label(port_form_frame, textvariable=port_status, style="Muted.TLabel")
+    port_status_label.grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+    def apply_port_defaults(cmake_file: Path):
+        project_name, target_name = _infer_cmake_defaults(cmake_file)
+        if project_name and not port_package_var.get().strip():
+            port_package_var.set(project_name)
+        if target_name and not port_target_var.get().strip():
+            port_target_var.set(target_name)
+        if not port_package_var.get().strip() and port_root_var.get():
+            port_package_var.set(Path(port_root_var.get()).name)
+
+    def browse_port_root():
+        path = filedialog.askdirectory()
+        if not path:
+            return
+        port_root_var.set(path)
+        cmake_candidate = Path(path) / "CMakeLists.txt"
+        if cmake_candidate.exists():
+            port_cmake_var.set(str(cmake_candidate))
+            apply_port_defaults(cmake_candidate)
+
+    def browse_port_cmake():
+        path = filedialog.askopenfilename(filetypes=[("CMakeLists", "CMakeLists.txt"), ("All files", "*")])
+        if not path:
+            return
+        port_cmake_var.set(path)
+        port_root_var.set(str(Path(path).parent))
+        apply_port_defaults(Path(path))
+
+    port_root_button.configure(command=browse_port_root)
+    port_cmake_button.configure(command=browse_port_cmake)
+
+    port_actions = ttk.Frame(create_page, style="Content.TFrame")
+    port_actions.grid(row=3, column=0, sticky="e", pady=(12, 0))
+
+    def on_port():
+        project_root_text = port_root_var.get().strip()
+        cmake_text = port_cmake_var.get().strip()
+        target_name = port_target_var.get().strip()
+        package_name = port_package_var.get().strip()
+        publisher = port_publisher_var.get().strip() or default_publisher
+        uwp_dir_name = port_uwp_dir_var.get().strip()
+
+        if not project_root_text:
+            messagebox.showerror("Missing project", "Project root is required.")
+            return
+        if not cmake_text:
+            messagebox.showerror("Missing CMakeLists", "Root CMakeLists.txt is required.")
+            return
+        if not target_name:
+            messagebox.showerror("Missing target", "Target name is required.")
+            return
+        if not package_name:
+            package_name = target_name
+
+        project_root = Path(project_root_text).expanduser().resolve()
+        cmake_path = Path(cmake_text).expanduser().resolve()
+
+        try:
+            uwp_dir, modified, note = port_existing_project(
+                project_root=project_root,
+                cmake_path=cmake_path,
+                target_name=target_name,
+                package_name=package_name,
+                publisher=publisher,
+                uwp_dir_name=uwp_dir_name,
+                arch=default_arch,
+                include_msvc_dlls=port_include_msvc_var.get(),
+                use_deps_libs=port_use_deps_libs_var.get(),
+                overwrite=port_overwrite_var.get(),
+                patch_cmake=port_patch_cmake_var.get(),
+            )
+        except Exception as exc:
+            messagebox.showerror("Port failed", str(exc))
+            port_status.set(f"Failed: {exc}")
+            return
+
+        details = f"UWP files created at:\n{uwp_dir}"
+        if modified:
+            details += "\nCMakeLists.txt updated."
+        elif note:
+            details += f"\n{note}"
+        messagebox.showinfo("Port complete", details)
+        port_status.set(f"Ported at {uwp_dir}")
+
+    ttk.Button(port_actions, text="Port Project", style="Accent.TButton", command=on_port).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(port_actions, text="Close", style="Ghost.TButton", command=root.destroy).grid(row=0, column=1)
+
+    def set_create_mode(mode: str):
+        if mode == "port":
+            create_form_frame.grid_remove()
+            create_actions.grid_remove()
+            port_form_frame.grid()
+            port_actions.grid()
+            mode_create_btn.configure(style="Ghost.TButton")
+            mode_port_btn.configure(style="Accent.TButton")
+        else:
+            port_form_frame.grid_remove()
+            port_actions.grid_remove()
+            create_form_frame.grid()
+            create_actions.grid()
+            mode_create_btn.configure(style="Accent.TButton")
+            mode_port_btn.configure(style="Ghost.TButton")
+
+    set_create_mode("create")
 
     pages["create"] = create_page
 
