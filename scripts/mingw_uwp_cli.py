@@ -30,6 +30,10 @@ try:
 except Exception:
     Image = None
 
+__AUTHOR__ = "Momo-AUX1"
+__VERSION__ = "1.0.0"
+__GIT_URL__ = ""
+
 TEXT_EXTENSIONS = {'.txt', '.in', '.xml', '.xaml', '.cpp', '.h', '.hpp', '.c', '.cmake', 'CMakeLists.txt', '.md'}
 DEFAULT_CONFIG_NAME = 'mingw_winrt.json'
 ARCH_CHOICES = ('x64', 'x86', 'arm64', 'arm')
