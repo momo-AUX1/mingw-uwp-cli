@@ -32,7 +32,7 @@ except Exception:
 
 __AUTHOR__ = "Momo-AUX1"
 __VERSION__ = "1.0.0"
-__GIT_URL__ = ""
+__GIT_URL__ = "https://github.com/momo-AUX1/mingw-uwp-cli"
 
 TEXT_EXTENSIONS = {'.txt', '.in', '.xml', '.xaml', '.cpp', '.h', '.hpp', '.c', '.cmake', 'CMakeLists.txt', '.md'}
 DEFAULT_CONFIG_NAME = 'mingw_winrt.json'
@@ -540,7 +540,9 @@ def _write_port_manifest(manifest_path: Path) -> None:
     manifest_path.write_text(manifest, encoding='utf-8')
 
 def _write_port_module(module_path: Path, default_package: str, default_publisher: str) -> None:
-    template = """# MinGW UWP port module
+    template = """
+# Made by MinGW UWP CLI v__VERSION__ (__GIT_URL__)
+# MinGW UWP port module
 # Include this file from your root CMakeLists.txt and call:
 #   mingw_uwp_setup(<target>)
 #
@@ -964,7 +966,7 @@ function(mingw_uwp_setup target)
   endif()
 endfunction()
 """
-    module = template.replace("__DEFAULT_PACKAGE_NAME__", default_package).replace("__DEFAULT_PUBLISHER__", default_publisher)
+    module = template.replace("__DEFAULT_PACKAGE_NAME__", default_package).replace("__DEFAULT_PUBLISHER__", default_publisher).replace("__VERSION__",__VERSION__).replace("__GIT_URL__", __GIT_URL__)
     module_path.write_text(module, encoding='utf-8')
 
 def _append_cmake_port_snippet(cmake_path: Path, uwp_dir_name: str, target_name: str, use_deps_libs: bool) -> tuple[bool, str]:
